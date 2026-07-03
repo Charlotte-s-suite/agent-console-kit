@@ -2,14 +2,20 @@ import { useEffect, useRef, useState } from 'react';
 import { Terminal } from 'xterm';
 import 'xterm/css/xterm.css';
 import { C } from './render/tokens';
-import TuiKeyboard from './TuiKeyboard';
 
 // HeadTerminal — the reusable raw-TUI engine (extracted from TerminalPanel so the console head-view
 // and the terminal drawer share ONE implementation, no copy-paste). It owns the whole lifecycle for a
 // SINGLE target: open a session (a head pane-mirror via /open, or a blank shell via /spawn), stream the
 // host relay's RAW PTY BYTES (tmux pipe-pane) over SSE into xterm.js — real cursor, scrollback, ANSI,
 // and every interactive TUI element (AskUserQuestion cards, the /model picker, plan prompts, spinners)
-// — forward keystrokes + key-bar taps to /input, and tear everything down on swipe-away / unmount.
+// — forward keystrokes LIVE to /input, and tear everything down on swipe-away / unmount.
+//
+// INPUT MODEL (v0.3 overhaul — kill the dual-box confusion): the terminal is driven LIVE, full stop.
+// A single hidden input summons the phone's NATIVE keyboard and forwards every keystroke straight to
+// the PTY (letters/numbers via onInput, keys that emit no data — Enter/Backspace/Tab/Esc/arrows — via
+// onKeyDown); a slim ACCESSORY key-bar above it supplies only the keys phones lack (Esc/Tab/Ctrl/
+// arrows/pipe/^C…), also live. No message composer, no shared draft, no separate on-screen QWERTY —
+// composing a MESSAGE is the chat view's Composer, a distinct surface. Identical for pane + shell.
 //
 // Streaming is gated on `active`: only the on-screen instance opens a session + pipes (demand-gated at
 // the relay → off by default for every other head). The client only ever knows the session id; the
@@ -19,15 +25,21 @@ import TuiKeyboard from './TuiKeyboard';
 // already carries real terminal bytes).
 const b64bytes = (b64: string): Uint8Array => Uint8Array.from(atob(b64), (ch) => ch.charCodeAt(0));
 
-// key-bar (phone-missing keys) → the bytes each sends to /input
+// accessory bar — ONLY the keys a phone's native keyboard can't produce (letters/numbers come from
+// the native keyboard itself). Every tap sends its bytes LIVE to the PTY.
 const KEYBAR: { label: string; bytes: string }[] = [
   { label: 'Esc', bytes: '\x1b' }, { label: 'Tab', bytes: '\t' },
-  { label: '↑', bytes: '\x1b[A' }, { label: '↓', bytes: '\x1b[B' },
-  { label: '←', bytes: '\x1b[D' }, { label: '→', bytes: '\x1b[C' },
+  { label: '←', bytes: '\x1b[D' }, { label: '↓', bytes: '\x1b[B' },
+  { label: '↑', bytes: '\x1b[A' }, { label: '→', bytes: '\x1b[C' },
   { label: '⌃C', bytes: '\x03' }, { label: '⌃D', bytes: '\x04' }, { label: '⌃Z', bytes: '\x1a' },
-  { label: '⏎', bytes: '\r' }, { label: '/', bytes: '/' }, { label: '|', bytes: '|' },
-  { label: '~', bytes: '~' }, { label: '-', bytes: '-' },
+  { label: '|', bytes: '|' }, { label: '~', bytes: '~' }, { label: '-', bytes: '-' },
 ];
+
+// native-keyboard keys that emit no onInput data — forwarded to the PTY as their control sequences.
+const SPECIAL_KEYS: Record<string, string> = {
+  Enter: '\r', Backspace: '\x7f', Tab: '\t', Escape: '\x1b',
+  ArrowUp: '\x1b[A', ArrowDown: '\x1b[B', ArrowLeft: '\x1b[D', ArrowRight: '\x1b[C',
+};
 
 type Sess = { sid: string; scrub: boolean };
 
@@ -35,22 +47,21 @@ export type HeadTerminalProps = {
   // KIT CONTRACT (agent-console-kit PORTING.md): the engine is host-app-agnostic. `sessionTarget`
   // names whatever the host backend resolves to a PTY (an HQ head, a Merritt site agent) — the
   // component never resolves it, it POSTs it. `apiBase` prefixes the terminal engine routes
-  // (open/spawn/stream/input/resize/scrub/close); `messageApiBase` prefixes the shared-draft
-  // MESSAGE send (a chat-side concern — a pure-terminal consumer just never triggers it). HQ
-  // defaults reproduce today's behavior exactly; the /open wire body keeps the `head` key until
-  // the kit stabilizes a v0.2 contract (backend-coordinated, not a UI rename).
+  // (open/spawn/stream/input/resize/scrub/close). HQ defaults reproduce today's behavior; the /open
+  // wire body keeps the `head` key until a backend-coordinated contract rename.
+  //
+  // v0.3: the terminal is LIVE-ONLY. It no longer composes MESSAGES — the shared-draft (chat⟷TUI)
+  // and its `messageApiBase` are gone; message-composing is the chat view's Composer, a separate
+  // surface. This is what kills the dual-box/confused-keyboard: one terminal, one live keyboard.
   sessionTarget?: string;        // required for kind 'pane' (the target whose PTY to mirror)
   apiBase?: string;              // terminal-engine route prefix (default '/api/hq/term')
-  messageApiBase?: string;       // message-send route prefix for the shared draft (default '/api/hq')
   kind?: 'pane' | 'shell';       // 'pane' = mirror a target (default), 'shell' = spawn a blank bash
   active: boolean;               // stream ONLY while active (one session at a time; off-screen tears down)
-  interactive?: boolean;         // show key-bar + input line + write keystrokes (default true)
+  interactive?: boolean;         // show the accessory bar + live-input + write keystrokes (default true)
   openDelayMs?: number;          // debounce before opening (deck swipe anti-thrash; default 0)
   showControls?: boolean;        // render the per-session control bar (scrub toggle / close) (default true)
   onClose?: () => void;          // if set, a ⏹ close button is rendered + invoked after closing
   onError?: (msg: string | null) => void;   // surface open/spawn errors to the host chrome
-  draft?: string;                // SHARED message draft (chat⟷TUI) — composer + keyboard build it
-  onDraft?: (v: string) => void; // update the shared draft
 };
 
 // brief keep-alive after a session goes inactive — swiping back before this fires reuses the session
@@ -70,15 +81,11 @@ const fitFontSize = (availW: number, cols: number) =>
   Math.max(4, Math.min(16, Math.floor(availW / (cols * CHAR_RATIO))));
 
 export default function HeadTerminal({
-  sessionTarget, apiBase = '/api/hq/term', messageApiBase = '/api/hq', kind = 'pane', active, interactive = true,
-  openDelayMs = 0, showControls = true, onClose, onError, draft: draftProp, onDraft,
+  sessionTarget, apiBase = '/api/hq/term', kind = 'pane', active, interactive = true,
+  openDelayMs = 0, showControls = true, onClose, onError,
 }: HeadTerminalProps) {
   const [sess, setSess] = useState<Sess | null>(null);
-  const [localDraft, setLocalDraft] = useState('');   // fallback when the deck doesn't pass a shared draft
-  const draft = draftProp ?? localDraft;
-  const setDraft = (v: string) => { if (onDraft) onDraft(v); else setLocalDraft(v); };
   const [ctrlArmed, setCtrlArmed] = useState(false);  // sticky Ctrl (next letter → control byte)
-  const [kbOpen, setKbOpen] = useState(false);        // in-app full keyboard (TUI mode) — collapsible
   const toggleCtrl = () => { const n = !ctrlRef.current; ctrlRef.current = n; setCtrlArmed(n); };
 
   const rootRef = useRef<HTMLDivElement | null>(null);   // clip viewport (height = section's flex box)
@@ -161,9 +168,8 @@ export default function HeadTerminal({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // ---- input: forward raw bytes LIVE to the pane; sticky-Ctrl maps a single letter to its control byte.
-  // Used for desktop xterm keystrokes, the key-bar, and the in-app keyboard's SPECIAL keys (esc/tab/arrows/
-  // ctrl-combos) — the keys that must act immediately. TEXT goes through the shared DRAFT instead (onKbKey).
+  // ---- input: forward raw bytes LIVE to the PTY; sticky-Ctrl maps a single letter to its control byte.
+  // Every input path funnels here — the accessory bar, the desktop xterm, and the native-keyboard field.
   const sendBytes = (data: string) => {
     const sid = sidRef.current;
     if (!sid) return;
@@ -176,37 +182,6 @@ export default function HeadTerminal({
       method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ data: out }),
     }).catch(() => {});
   };
-
-  // send the shared draft as a MESSAGE (the same path the chat composer uses → creates the bubble + audit),
-  // then clear it. Lets a draft begun in chat be sent from the TUI (or vice versa).
-  const sendDraft = async () => {
-    const text = (draft || '').trim();
-    if (!text || !sessionTarget) return;
-    try {
-      const r = await fetch(`${messageApiBase}/head/${encodeURIComponent(sessionTarget)}/input`, {
-        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ text }),
-      });
-      if (r.ok) setDraft('');   // clear ONLY on success — keep the draft if the send failed (Warden #58)
-    } catch { /* keep the draft so an offline/failed send doesn't silently lose the message */ }
-  };
-
-  // in-app keyboard router. A blank SHELL is a real terminal: EVERYTHING goes LIVE to the PTY (the shell
-  // echoes it back into xterm — that's the visible prompt + cursor). A head-view MIRROR keeps the
-  // message-draft model: TEXT builds the shared draft (persists until Send); SPECIAL keys go live.
-  const onKbKey = (data: string) => {
-    if (kind === 'shell') { sendBytes(data === '\n' ? '\r' : data); return; }       // shell → live passthrough
-    if (ctrlRef.current && /^[a-zA-Z]$/.test(data)) { sendBytes(data); return; }   // ctrl-combo → live
-    if (/^[\x20-\x7e]$/.test(data)) { setDraft((draft || '') + data); return; }     // printable → draft
-    if (data === '\x7f' || data === '\b') { setDraft((draft || '').slice(0, -1)); return; }  // backspace → pop
-    if (data === '\r' || data === '\n') {
-      if ((draft || '').trim()) void sendDraft();   // draft present → send it
-      else sendBytes('\r');                          // bare Enter → confirm a menu/prompt LIVE (Warden #58)
-      return;
-    }
-    sendBytes(data);                                                                // esc/tab/arrows → live
-  };
-
-  const sendLine = () => { void sendDraft(); };   // the TUI composer sends the shared draft (chat-message path)
 
   // Alt-screen TUIs (Claude Code) scroll via MOUSE WHEEL, not terminal scrollback — and a phone has
   // neither a wheel nor scrollback to drag. Forward SGR wheel events to the head through the same
@@ -475,9 +450,10 @@ export default function HeadTerminal({
         /* keep the terminal at its NATURAL (fit-to-width) height — never let the flex column stretch it. */
         .hq-term-host>.xterm{flex:0 0 auto !important}
         .hq-term-mirror .xterm-cursor,.hq-term-mirror .xterm-cursor-outline{display:none !important;border:0 !important;background:transparent !important}`}</style>
-      {/* BLOCK = header(controls) → terminal → key-bar → composer as ONE contiguous, NATURAL-height column.
-          Top-anchored under the header (slack, if any, sits BELOW the composer). `slide()` sets translateY
-          to ride the composer just above the keyboard when the section shrinks. */}
+      {/* BLOCK = header(controls) → terminal → accessory-bar → live-input as ONE contiguous,
+          NATURAL-height column. Top-anchored under the header (slack, if any, sits BELOW the input).
+          `slide()` sets translateY to ride the live-input just above the keyboard when the section
+          shrinks (the visualViewport shrinks it when the native keyboard opens). */}
       <div ref={blockRef} style={{ display: 'flex', flexDirection: 'column', willChange: 'transform' }}>
       {showControls && sess && (
         <div style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '4px 6px 6px', flex: '0 0 auto' }}>
@@ -514,79 +490,43 @@ export default function HeadTerminal({
 
       {interactive && sess && (
         <>
-          {/* When the in-app keyboard is open it IS the input — hide the key-bar (Esc/Tab/Ctrl/arrows are
-              duplicated on it) AND the composer (whose <input> summons the native keyboard, so all three
-              stacked). Closed → key-bar (carrying the ⌨ toggle) + composer; the keyboard's ▾ closes it. */}
-          {!kbOpen && (<>
-          {/* key-bar — phone-missing keys (Esc/Tab/arrows/Ctrl-combos); horizontally scrollable */}
+          {/* ACCESSORY bar — ONLY the keys a native keyboard can't produce, all LIVE to the PTY.
+              Sticky Ctrl + scroll + Esc/Tab/arrows/pipe/^C… Horizontally scrollable; pins just above
+              the native keyboard's input below it. */}
           <div style={{ display: 'flex', gap: 5, padding: '6px 2px 0', overflowX: 'auto', flex: '0 0 auto' }}>
-            <button type="button" onClick={() => setKbOpen((o) => !o)} title="in-app keyboard (no native keyboard)"
-              style={{ flexShrink: 0, fontFamily: C.mono, fontSize: 13, padding: '6px 11px', borderRadius: C.radius, cursor: 'pointer',
-                border: `1px solid ${kbOpen ? C.green : C.line2}`, background: kbOpen ? 'rgba(34,255,106,.12)' : C.raised, color: kbOpen ? C.green : C.ink }}>⌨</button>
             <button type="button" onClick={toggleCtrl}
-              title="sticky Ctrl — next letter is sent as its control byte"
+              title="sticky Ctrl — the next letter is sent as its control byte (⌃A…⌃Z)"
               style={{ flexShrink: 0, fontFamily: C.mono, fontSize: 12, padding: '6px 11px', borderRadius: C.radius, cursor: 'pointer',
                 border: `1px solid ${ctrlArmed ? C.amber : C.line2}`, background: ctrlArmed ? 'rgba(255,207,92,.16)' : C.raised, color: ctrlArmed ? C.amber : C.ink }}>Ctrl</button>
-            <button type="button" onClick={() => sendWheel('up')} title="scroll the head's view up"
+            <button type="button" onClick={() => sendWheel('up')} title="scroll the terminal view up"
               style={{ flexShrink: 0, fontFamily: C.mono, fontSize: 13, padding: '6px 10px', borderRadius: C.radius, cursor: 'pointer', border: `1px solid ${C.line2}`, background: C.raised, color: C.ink }}>⤒</button>
-            <button type="button" onClick={() => sendWheel('down')} title="scroll the head's view down"
+            <button type="button" onClick={() => sendWheel('down')} title="scroll the terminal view down"
               style={{ flexShrink: 0, fontFamily: C.mono, fontSize: 13, padding: '6px 10px', borderRadius: C.radius, cursor: 'pointer', border: `1px solid ${C.line2}`, background: C.raised, color: C.ink }}>⤓</button>
             {KEYBAR.map((k) => (
-              <button key={k.label} type="button" onClick={() => sendBytes(k.bytes)}
+              <button key={k.label} type="button" onMouseDown={(e) => { e.preventDefault(); sendBytes(k.bytes); }} title={`send ${k.label}`}
                 style={{ flexShrink: 0, fontFamily: C.mono, fontSize: 12, padding: '6px 10px', borderRadius: C.radius, cursor: 'pointer',
                   border: `1px solid ${C.line2}`, background: C.raised, color: C.ink }}>{k.label}</button>
             ))}
           </div>
 
-          {kind === 'shell' ? (
-            /* blank SHELL — a LIVE keystroke capture, not a message box. The field stays empty (it only
-               summons the native keyboard + forwards keystrokes straight to the PTY); your text, the `$`
-               prompt and the cursor all live in the terminal ABOVE, because the shell echoes what it
-               receives. onInput forwards printable text (handles autocorrect/paste batches) then clears;
-               onKeyDown forwards the keys that emit no input data (Enter/Backspace/Tab/Esc/arrows). */
-            <div style={{ display: 'flex', gap: 6, padding: '7px 2px 0', flex: '0 0 auto' }}>
-              <input
-                defaultValue="" autoFocus inputMode="text" autoCapitalize="off" autoCorrect="off" spellCheck={false}
-                placeholder="type — goes live to the shell ↑"
-                onInput={(e) => { const el = e.target as HTMLInputElement; if (el.value) { sendBytes(el.value); el.value = ''; } }}
-                onKeyDown={(e) => {
-                  const m: Record<string, string> = { Enter: '\r', Backspace: '\x7f', Tab: '\t', Escape: '\x1b',
-                    ArrowUp: '\x1b[A', ArrowDown: '\x1b[B', ArrowLeft: '\x1b[D', ArrowRight: '\x1b[C' };
-                  if (m[e.key]) { sendBytes(m[e.key]); e.preventDefault(); }
-                }}
-                style={{ flex: 1, background: '#04070a', color: C.green, border: `1px solid ${C.line2}`, borderRadius: C.radius, fontFamily: C.mono, fontSize: 16, padding: '8px 9px', caretColor: C.green }} />
-            </div>
-          ) : (
-            /* head-view MIRROR — the SHARED draft (chat⟷TUI); type a message + Send */
-            <div style={{ display: 'flex', gap: 6, padding: '7px 2px 0', flex: '0 0 auto' }}>
-              <input value={draft} onChange={(e) => setDraft(e.target.value)} onKeyDown={(e) => { if (e.key === 'Enter') sendLine(); }}
-                placeholder={`message ${sessionTarget ?? ''}…`} autoCapitalize="off" autoCorrect="off" spellCheck={false}
-                style={{ flex: 1, background: C.raised, color: C.ink, border: `1px solid ${C.line2}`, borderRadius: C.radius, fontFamily: C.mono, fontSize: 16, padding: '8px 9px' }} />
-              <button type="button" onClick={sendLine}
-                style={{ fontFamily: C.mono, fontSize: 12, padding: '8px 14px', borderRadius: C.radius, cursor: 'pointer', border: `1px solid ${C.green}`, background: 'rgba(34,255,106,.10)', color: C.green }}>Send ↵</button>
-            </div>
-          )}
-          </>)}
-
-          {/* shared-draft strip (above the in-app keyboard) — persists until Send; the SAME draft as the chat
-              composer, so a message begun in chat continues here (or vice versa). Send fires it as a message.
-              A blank shell has no draft (the in-app keyboard routes every key LIVE), so skip it there. */}
-          {kbOpen && kind !== 'shell' && (
-            <div style={{ flex: '0 0 auto', display: 'flex', alignItems: 'center', gap: 6, padding: '5px 6px',
-              background: 'rgba(34,255,106,.05)', borderTop: `1px solid ${C.line}` }}>
-              <div style={{ flex: 1, minWidth: 0, fontFamily: C.mono, fontSize: 13, color: C.ink, whiteSpace: 'nowrap',
-                overflow: 'hidden', textOverflow: 'ellipsis', direction: 'rtl', textAlign: 'left' }}>
-                <span style={{ direction: 'ltr', unicodeBidi: 'plaintext' }}>❯ {draft || <span style={{ color: C.faint }}>{`message ${sessionTarget ?? ''}…`}</span>}</span>
-                <span style={{ direction: 'ltr', color: C.green, animation: 'hq-blink 1s step-end infinite' }}>▊</span>
-              </div>
-              <button type="button" onClick={() => void sendDraft()} disabled={!draft.trim()}
-                style={{ flex: '0 0 auto', fontFamily: C.mono, fontSize: 12, padding: '6px 12px', borderRadius: C.radius,
-                  cursor: draft.trim() ? 'pointer' : 'default', border: `1px solid ${draft.trim() ? C.green : C.line2}`,
-                  background: draft.trim() ? 'rgba(34,255,106,.12)' : C.raised, color: draft.trim() ? C.green : C.faint }}>Send ↵</button>
-            </div>
-          )}
-          {/* in-app full keyboard (collapsible). onKbKey routes TEXT → the shared draft, SPECIAL keys → live. */}
-          {kbOpen && <TuiKeyboard onBytes={onKbKey} ctrlArmed={ctrlArmed} onToggleCtrl={toggleCtrl} onHide={() => setKbOpen(false)} />}
+          {/* LIVE native-keyboard input — the single input surface for the terminal. It summons the
+              phone's native keyboard and forwards every keystroke straight to the PTY; the field stays
+              empty (your text, prompt + cursor render in the terminal ABOVE, echoed by the head/shell).
+              onInput forwards printable text (autocorrect/paste batches) then clears; onKeyDown forwards
+              the keys that emit no input data (Enter/Backspace/Tab/Esc/arrows). Same for pane + shell.
+              onMouseDown on the accessory buttons preventDefault so tapping a key never steals focus
+              (native keyboard stays up). */}
+          <div style={{ display: 'flex', gap: 6, padding: '7px 2px 0', flex: '0 0 auto' }}>
+            <input
+              defaultValue="" inputMode="text" autoCapitalize="off" autoCorrect="off" spellCheck={false}
+              autoFocus={kind === 'shell'}
+              placeholder={`type — keystrokes go live to ${kind === 'shell' ? 'the shell' : (sessionTarget ?? 'the head')} ↑`}
+              onInput={(e) => { const el = e.target as HTMLInputElement; if (el.value) { sendBytes(el.value); el.value = ''; } }}
+              onKeyDown={(e) => {
+                if (SPECIAL_KEYS[e.key]) { sendBytes(SPECIAL_KEYS[e.key]); e.preventDefault(); }
+              }}
+              style={{ flex: 1, background: '#04070a', color: C.green, border: `1px solid ${ctrlArmed ? C.amber : C.line2}`, borderRadius: C.radius, fontFamily: C.mono, fontSize: 16, padding: '8px 9px', caretColor: C.green }} />
+          </div>
         </>
       )}
       </div>

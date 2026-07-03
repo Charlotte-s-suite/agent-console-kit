@@ -29,23 +29,28 @@ Upgrade both apps with a version bump + `npm update`. (Or a git submodule if you
 All verbatim from HQ, dependency-free beyond React. `sanitizeUrl.test.ts` ships too — the one piece of
 the console with real test coverage; keep it green.
 
-## v0.2 — the crown jewels landed
+## v0.3 — one terminal, one live keyboard (⚠️ breaking)
 
-`HeadTerminal` (mirror any PTY over SSE + xterm.js: byte stream, resize negotiation, key-bar,
-sticky-ctrl, touch-scroll-to-wheel, visible reconnect states) and `Composer` (slash-autocomplete +
-browsable command catalog, attachments, draft-lifting, ghost-suggest) are HERE, parameterized per
-PORTING.md (hydra-hq PR #122 pinned the contract; #118/#119 hardening included):
+The TUI input model was overhauled (Schyler, 2026-07-03): the dual message-box + collapsible
+on-screen QWERTY that muddled "type a message" with "drive the terminal live" is **gone**. The
+terminal is now **LIVE-ONLY** — a single input summons the phone's NATIVE keyboard and forwards
+every keystroke straight to the PTY, with a slim **accessory bar** (Esc/Tab/Ctrl/arrows/`|`/`~`/^C…)
+for the keys phones lack, also live. Composing a MESSAGE is the chat view's `Composer`, a separate
+surface. Identical for `pane` and `shell`.
 
-- `HeadTerminal { sessionTarget, apiBase='/api/hq/term', messageApiBase='/api/hq', kind, active, … }`
+**Breaking:** `HeadTerminal` dropped `draft` / `onDraft` / `messageApiBase` (it no longer sends
+messages). Consumers that had a chat⟷TUI shared draft: keep the draft on the chat `Composer`; the
+terminal doesn't take one. `TuiKeyboard` is still exported but no longer used internally.
+
+- `HeadTerminal { sessionTarget, apiBase='/api/hq/term', kind, active, interactive?, showControls?, onClose?, onError? }`
   — POSTs `{"head": sessionTarget}` to `${apiBase}/open`; engine routes are
   `${apiBase}/{spawn,open}` + `${apiBase}/{sid}/{stream,input,resize,scrub,close}`. Requires the
   `xterm` peer dep.
 - `Composer { sessionTarget, apiBase='/api/hq', commandsFetcher?, onSent?, draft?/onDraft?, suggest? }`
-  — sends to `${apiBase}/head/{sessionTarget}/{input,upload}`; catalog defaults to `${apiBase}/commands`.
+  — unchanged; sends to `${apiBase}/head/{sessionTarget}/{input,upload}`, catalog `${apiBase}/commands`.
 
-The wire keeps the `head` path/body key until a coordinated v0.3 contract rename. Head-lifecycle
-CONTROLS (spawn/kill/rename UI — hydra-hq PR #121's `LifecyclePanel` + `POST /lifecycle` contract)
-stay host-side for now; they generalize here next.
+The wire keeps the `head` path/body key until a coordinated contract rename. Head-lifecycle CONTROLS
+(spawn/kill/rename UI — hydra-hq PR #121's `LifecyclePanel` + `POST /lifecycle`) stay host-side for now.
 
 ## The model going forward
 
