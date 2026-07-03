@@ -12,7 +12,7 @@ frontend).
 
 **Consume it (in hydra-hq or merritt `package.json`):**
 ```json
-"dependencies": { "@charlotte/agent-console-kit": "github:Charlotte-s-suite/agent-console-kit#v0.1.0" }
+"dependencies": { "@charlotte/agent-console-kit": "github:Charlotte-s-suite/agent-console-kit#v0.2.0" }
 ```
 Upgrade both apps with a version bump + `npm update`. (Or a git submodule if you prefer vendoring.)
 
@@ -29,14 +29,23 @@ Upgrade both apps with a version bump + `npm update`. (Or a git submodule if you
 All verbatim from HQ, dependency-free beyond React. `sanitizeUrl.test.ts` ships too — the one piece of
 the console with real test coverage; keep it green.
 
-## The port roadmap (what comes next — see PORTING.md)
+## v0.2 — the crown jewels landed
 
-The **crown jewel** — `HeadTerminal` (mirror any PTY over SSE + xterm.js: byte stream, resize
-negotiation, key-bar, sticky-ctrl, touch-scroll-to-wheel) — and `Composer` (slash-autocomplete,
-attachments, draft-lifting) are **not yet here** because they hardcode HQ's `/api/hq/*` routes and a
-`head`-named target. They move here after a small parameterization pass (route-prefix + `sessionTarget`
-as props) so both apps share one engine. That refactor is HQ audit item #7 and is the natural moment to
-also add head-lifecycle controls (spawn/kill/rename) that Merritt needs anyway.
+`HeadTerminal` (mirror any PTY over SSE + xterm.js: byte stream, resize negotiation, key-bar,
+sticky-ctrl, touch-scroll-to-wheel, visible reconnect states) and `Composer` (slash-autocomplete +
+browsable command catalog, attachments, draft-lifting, ghost-suggest) are HERE, parameterized per
+PORTING.md (hydra-hq PR #122 pinned the contract; #118/#119 hardening included):
+
+- `HeadTerminal { sessionTarget, apiBase='/api/hq/term', messageApiBase='/api/hq', kind, active, … }`
+  — POSTs `{"head": sessionTarget}` to `${apiBase}/open`; engine routes are
+  `${apiBase}/{spawn,open}` + `${apiBase}/{sid}/{stream,input,resize,scrub,close}`. Requires the
+  `xterm` peer dep.
+- `Composer { sessionTarget, apiBase='/api/hq', commandsFetcher?, onSent?, draft?/onDraft?, suggest? }`
+  — sends to `${apiBase}/head/{sessionTarget}/{input,upload}`; catalog defaults to `${apiBase}/commands`.
+
+The wire keeps the `head` path/body key until a coordinated v0.3 contract rename. Head-lifecycle
+CONTROLS (spawn/kill/rename UI — hydra-hq PR #121's `LifecyclePanel` + `POST /lifecycle` contract)
+stay host-side for now; they generalize here next.
 
 ## The model going forward
 

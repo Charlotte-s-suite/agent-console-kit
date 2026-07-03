@@ -1,0 +1,595 @@
+import { useEffect, useRef, useState } from 'react';
+import { Terminal } from 'xterm';
+import 'xterm/css/xterm.css';
+import { C } from './render/tokens';
+import TuiKeyboard from './TuiKeyboard';
+
+// HeadTerminal — the reusable raw-TUI engine (extracted from TerminalPanel so the console head-view
+// and the terminal drawer share ONE implementation, no copy-paste). It owns the whole lifecycle for a
+// SINGLE target: open a session (a head pane-mirror via /open, or a blank shell via /spawn), stream the
+// host relay's RAW PTY BYTES (tmux pipe-pane) over SSE into xterm.js — real cursor, scrollback, ANSI,
+// and every interactive TUI element (AskUserQuestion cards, the /model picker, plan prompts, spinners)
+// — forward keystrokes + key-bar taps to /input, and tear everything down on swipe-away / unmount.
+//
+// Streaming is gated on `active`: only the on-screen instance opens a session + pipes (demand-gated at
+// the relay → off by default for every other head). The client only ever knows the session id; the
+// server holds the sid→pane map + re-validates it (no injection). SSO + audit + cap/kill are server-side.
+
+// base64 (a raw-byte SSE chunk) -> Uint8Array for term.write (no utf-8 decode, no \n→\r\n: the stream
+// already carries real terminal bytes).
+const b64bytes = (b64: string): Uint8Array => Uint8Array.from(atob(b64), (ch) => ch.charCodeAt(0));
+
+// key-bar (phone-missing keys) → the bytes each sends to /input
+const KEYBAR: { label: string; bytes: string }[] = [
+  { label: 'Esc', bytes: '\x1b' }, { label: 'Tab', bytes: '\t' },
+  { label: '↑', bytes: '\x1b[A' }, { label: '↓', bytes: '\x1b[B' },
+  { label: '←', bytes: '\x1b[D' }, { label: '→', bytes: '\x1b[C' },
+  { label: '⌃C', bytes: '\x03' }, { label: '⌃D', bytes: '\x04' }, { label: '⌃Z', bytes: '\x1a' },
+  { label: '⏎', bytes: '\r' }, { label: '/', bytes: '/' }, { label: '|', bytes: '|' },
+  { label: '~', bytes: '~' }, { label: '-', bytes: '-' },
+];
+
+type Sess = { sid: string; scrub: boolean };
+
+export type HeadTerminalProps = {
+  // KIT CONTRACT (agent-console-kit PORTING.md): the engine is host-app-agnostic. `sessionTarget`
+  // names whatever the host backend resolves to a PTY (an HQ head, a Merritt site agent) — the
+  // component never resolves it, it POSTs it. `apiBase` prefixes the terminal engine routes
+  // (open/spawn/stream/input/resize/scrub/close); `messageApiBase` prefixes the shared-draft
+  // MESSAGE send (a chat-side concern — a pure-terminal consumer just never triggers it). HQ
+  // defaults reproduce today's behavior exactly; the /open wire body keeps the `head` key until
+  // the kit stabilizes a v0.2 contract (backend-coordinated, not a UI rename).
+  sessionTarget?: string;        // required for kind 'pane' (the target whose PTY to mirror)
+  apiBase?: string;              // terminal-engine route prefix (default '/api/hq/term')
+  messageApiBase?: string;       // message-send route prefix for the shared draft (default '/api/hq')
+  kind?: 'pane' | 'shell';       // 'pane' = mirror a target (default), 'shell' = spawn a blank bash
+  active: boolean;               // stream ONLY while active (one session at a time; off-screen tears down)
+  interactive?: boolean;         // show key-bar + input line + write keystrokes (default true)
+  openDelayMs?: number;          // debounce before opening (deck swipe anti-thrash; default 0)
+  showControls?: boolean;        // render the per-session control bar (scrub toggle / close) (default true)
+  onClose?: () => void;          // if set, a ⏹ close button is rendered + invoked after closing
+  onError?: (msg: string | null) => void;   // surface open/spawn errors to the host chrome
+  draft?: string;                // SHARED message draft (chat⟷TUI) — composer + keyboard build it
+  onDraft?: (v: string) => void; // update the shared draft
+};
+
+// brief keep-alive after a session goes inactive — swiping back before this fires reuses the session
+// instead of thrashing open/close. The relay still stops piping the moment the SSE drops (demand TTL),
+// so this only governs the session record, not capture cost.
+const KEEPALIVE_MS = 600;
+
+// Drive the MIRRORED pane to this many COLUMNS (decoupled from the 120-col desktop clients via
+// window-size manual). Fewer cols → the fit-to-width font is BIGGER on a phone (100 ≈ ~6px vs 120 ≈ ~5px)
+// with still NO horizontal scroll. Dial DOWN (80/70) for bigger text. Restored to window-size latest →
+// back to the desktop width on disconnect (relay).
+const TARGET_MIRROR_COLS = 100;
+// monospace advance width ≈ CHAR_RATIO × font-size (conservative → guaranteed width fit). Shared by
+// fitFont (sizes the CURRENT pane cols) and the resize projection (pre-computes rows for TARGET cols).
+const CHAR_RATIO = 0.62;
+const fitFontSize = (availW: number, cols: number) =>
+  Math.max(4, Math.min(16, Math.floor(availW / (cols * CHAR_RATIO))));
+
+export default function HeadTerminal({
+  sessionTarget, apiBase = '/api/hq/term', messageApiBase = '/api/hq', kind = 'pane', active, interactive = true,
+  openDelayMs = 0, showControls = true, onClose, onError, draft: draftProp, onDraft,
+}: HeadTerminalProps) {
+  const [sess, setSess] = useState<Sess | null>(null);
+  const [localDraft, setLocalDraft] = useState('');   // fallback when the deck doesn't pass a shared draft
+  const draft = draftProp ?? localDraft;
+  const setDraft = (v: string) => { if (onDraft) onDraft(v); else setLocalDraft(v); };
+  const [ctrlArmed, setCtrlArmed] = useState(false);  // sticky Ctrl (next letter → control byte)
+  const [kbOpen, setKbOpen] = useState(false);        // in-app full keyboard (TUI mode) — collapsible
+  const toggleCtrl = () => { const n = !ctrlRef.current; ctrlRef.current = n; setCtrlArmed(n); };
+
+  const rootRef = useRef<HTMLDivElement | null>(null);   // clip viewport (height = section's flex box)
+  const blockRef = useRef<HTMLDivElement | null>(null);  // the contiguous terminal+key-bar+composer block
+  const hostRef = useRef<HTMLDivElement | null>(null);
+  const termRef = useRef<Terminal | null>(null);
+  const esRef = useRef<EventSource | null>(null);
+  const sidRef = useRef<string | null>(null);         // live sid for sendBytes/close (stable across renders)
+  const ctrlRef = useRef(false);
+  const openingRef = useRef(false);                    // guard against a double-open race during debounce
+  const mountedRef = useRef(true);                     // false after unmount → a resolving open self-closes
+  const activeRef = useRef(active);                    // current active, readable inside an async open
+  const lastRowsRef = useRef<number | null>(null);     // last row-count we asked the relay to mirror at
+
+  // ---- lifecycle: open while active (debounced), close on swipe-away / unmount -------------------
+  const teardownXterm = () => {
+    esRef.current?.close(); esRef.current = null;
+    termRef.current?.dispose(); termRef.current = null;
+  };
+
+  const closeSession = async () => {
+    const id = sidRef.current;
+    sidRef.current = null;
+    teardownXterm();
+    setSess(null);
+    if (id) { try { await fetch(`${apiBase}/${encodeURIComponent(id)}/close`, { method: 'POST' }); } catch { /* */ } }
+  };
+
+  const openSession = async () => {
+    if (sidRef.current || openingRef.current) return;   // already open / opening
+    if (kind === 'pane' && !sessionTarget) return;
+    openingRef.current = true;
+    onError?.(null);
+    try {
+      const r = kind === 'shell'
+        ? await fetch(`${apiBase}/spawn`, { method: 'POST' })
+        : await fetch(`${apiBase}/open`, {
+            // wire key stays `head` (the HQ backend contract) until the kit's v0.2 contract rename
+            method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ head: sessionTarget }),
+          });
+      const d = await r.json().catch(() => ({}));
+      if (!r.ok) { onError?.(d.detail || `${kind === 'shell' ? 'spawn' : 'open'} failed (${r.status})`); return; }
+      // open-vs-unmount race (the slot-leak): if we unmounted / went inactive / already adopted another
+      // sid while this POST was in flight, the returned slot is an orphan nothing else would ever close.
+      // Close it ourselves now instead of adopting it. (Dedup on the backend means a same-head re-open
+      // would have returned THIS very sid, so closing it is correct — the next open re-derives it.)
+      if (!mountedRef.current || !activeRef.current || sidRef.current) {
+        if (d.sid) { try { await fetch(`${apiBase}/${encodeURIComponent(d.sid)}/close`, { method: 'POST' }); } catch { /* */ } }
+        return;
+      }
+      sidRef.current = d.sid;
+      setSess({ sid: d.sid, scrub: kind === 'pane' ? d.scrub !== false : false });
+    } catch {
+      onError?.("can't reach the terminal backend");
+    } finally {
+      openingRef.current = false;
+    }
+  };
+
+  // open ~openDelayMs after becoming active; close ~KEEPALIVE_MS after going inactive (cancel either
+  // if `active` flips back first — that's the swipe debounce). Keyed on the target too, so changing
+  // head/kind re-opens cleanly.
+  useEffect(() => {
+    activeRef.current = active;                      // keep the async-readable copy current
+    let cancelled = false;
+    if (active) {
+      const t = setTimeout(() => { if (!cancelled) openSession(); }, openDelayMs);
+      return () => { cancelled = true; clearTimeout(t); };
+    }
+    const t = setTimeout(() => { if (!cancelled) closeSession(); }, KEEPALIVE_MS);
+    return () => { cancelled = true; clearTimeout(t); };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [active, sessionTarget, kind, openDelayMs]);
+
+  // hard close on unmount (project change / deck rebuild / TUI→chat toggle) — no leaked session/pipe.
+  // mountedRef flips false FIRST so an /open still in flight self-closes when it resolves (see openSession).
+  useEffect(() => {
+    mountedRef.current = true;                       // (re)assert on mount — StrictMode remounts cleanly
+    return () => { mountedRef.current = false; closeSession(); };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // ---- input: forward raw bytes LIVE to the pane; sticky-Ctrl maps a single letter to its control byte.
+  // Used for desktop xterm keystrokes, the key-bar, and the in-app keyboard's SPECIAL keys (esc/tab/arrows/
+  // ctrl-combos) — the keys that must act immediately. TEXT goes through the shared DRAFT instead (onKbKey).
+  const sendBytes = (data: string) => {
+    const sid = sidRef.current;
+    if (!sid) return;
+    let out = data;
+    if (ctrlRef.current && /^[a-zA-Z]$/.test(data)) {
+      out = String.fromCharCode(data.toLowerCase().charCodeAt(0) & 0x1f);
+      ctrlRef.current = false; setCtrlArmed(false);
+    }
+    fetch(`${apiBase}/${encodeURIComponent(sid)}/input`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ data: out }),
+    }).catch(() => {});
+  };
+
+  // send the shared draft as a MESSAGE (the same path the chat composer uses → creates the bubble + audit),
+  // then clear it. Lets a draft begun in chat be sent from the TUI (or vice versa).
+  const sendDraft = async () => {
+    const text = (draft || '').trim();
+    if (!text || !sessionTarget) return;
+    try {
+      const r = await fetch(`${messageApiBase}/head/${encodeURIComponent(sessionTarget)}/input`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ text }),
+      });
+      if (r.ok) setDraft('');   // clear ONLY on success — keep the draft if the send failed (Warden #58)
+    } catch { /* keep the draft so an offline/failed send doesn't silently lose the message */ }
+  };
+
+  // in-app keyboard router. A blank SHELL is a real terminal: EVERYTHING goes LIVE to the PTY (the shell
+  // echoes it back into xterm — that's the visible prompt + cursor). A head-view MIRROR keeps the
+  // message-draft model: TEXT builds the shared draft (persists until Send); SPECIAL keys go live.
+  const onKbKey = (data: string) => {
+    if (kind === 'shell') { sendBytes(data === '\n' ? '\r' : data); return; }       // shell → live passthrough
+    if (ctrlRef.current && /^[a-zA-Z]$/.test(data)) { sendBytes(data); return; }   // ctrl-combo → live
+    if (/^[\x20-\x7e]$/.test(data)) { setDraft((draft || '') + data); return; }     // printable → draft
+    if (data === '\x7f' || data === '\b') { setDraft((draft || '').slice(0, -1)); return; }  // backspace → pop
+    if (data === '\r' || data === '\n') {
+      if ((draft || '').trim()) void sendDraft();   // draft present → send it
+      else sendBytes('\r');                          // bare Enter → confirm a menu/prompt LIVE (Warden #58)
+      return;
+    }
+    sendBytes(data);                                                                // esc/tab/arrows → live
+  };
+
+  const sendLine = () => { void sendDraft(); };   // the TUI composer sends the shared draft (chat-message path)
+
+  // Alt-screen TUIs (Claude Code) scroll via MOUSE WHEEL, not terminal scrollback — and a phone has
+  // neither a wheel nor scrollback to drag. Forward SGR wheel events to the head through the same
+  // /input path (proven: send-keys -l passes the sequence through and Claude scrolls).
+  const sendWheel = (dir: 'up' | 'down', ticks = 3) => {
+    const t = termRef.current;
+    const col = t ? Math.max(1, t.cols >> 1) : 10;   // center coord — within any pane's scroll region
+    const row = t ? Math.max(1, t.rows >> 1) : 8;
+    const btn = dir === 'up' ? 64 : 65;
+    sendBytes(`\x1b[<${btn};${col};${row}M`.repeat(ticks));
+  };
+
+  // ---- xterm: raw-byte render keyed on the live sid ----------------------------------------------
+  useEffect(() => {
+    if (!sess || !hostRef.current) return;
+    lastRowsRef.current = null;          // new session → recompute the mirror row-count from scratch
+    // A pane MIRROR is read-only: the head's real cursor is already baked into the captured bytes, so
+    // xterm's OWN cursor block is a spurious artifact that lands at a stale position (Schyler: "cursor box
+    // in the wrong place"). Hide it for mirrors (transparent = bg colour, no blink); keep a real cursor for
+    // blank shells where xterm's cursor IS the live prompt.
+    const mirror = kind === 'pane';
+    // A blank SHELL gets a fixed, READABLE (chat-sized) font; cols are driven to fit the width (resizeShellOnce)
+    // so it wraps like a normal terminal instead of cramming 100+ mirror columns into ~5px. A mirror keeps the
+    // small fit-to-width font (it must show a head's full 100-120-col TUI without h-scroll).
+    const SHELL_FS = 15;
+    const term = new Terminal({
+      convertEol: false, cursorBlink: !mirror, disableStdin: !interactive, scrollback: 5000, fontSize: mirror ? 12 : SHELL_FS,
+      fontFamily: "'SFMono-Regular',ui-monospace,Consolas,monospace",
+      theme: { background: '#04070a', foreground: C.ink, ...(mirror ? { cursor: '#04070a', cursorAccent: '#04070a' } : {}) },
+    });
+    term.open(hostRef.current);
+    // Canvas renderer — MIRRORS ONLY. The Canvas addon is the documented iOS perf win (faster repaint, cleaner
+    // box-drawing) and the mirror's 3.5s resync repaints over any glitch. But a blank SHELL's block gets a CSS
+    // `transform` (the keyboard slide), and an ancestor transform BLANKS an xterm canvas on iOS Safari (the
+    // "terminal vanishes after a couple seconds" bug) with no resync to recover it — so shells use the reliable
+    // DOM renderer.
+    if (mirror) {
+      void import('xterm-addon-canvas').then(({ CanvasAddon }) => {
+        try { term.loadAddon(new CanvasAddon()); } catch { /* DOM renderer stays */ }
+      }).catch(() => { /* addon unavailable → DOM renderer */ });
+    }
+    termRef.current = term;
+    if (interactive) term.onData(sendBytes);   // desktop keystrokes (incl. Ctrl combos) as raw bytes
+
+    // FIT-TO-WIDTH, host wraps to the terminal's NATURAL height. Fitting BOTH axes meant the font was
+    // width-constrained (120 cols on a phone → ~4px) yet the host still filled the full column height
+    // (flex:1) — leaving a big slab of dead space that my bottom-anchor dumped ABOVE the text (Schyler:
+    // "big gap up above the text"). The slack only exists because the host was forced taller than the
+    // content. Fix: size the font to WIDTH only (no horizontal overflow — the thing he cares about) and
+    // let the host be exactly as tall as the rows render (host is flex:0 0 auto below) → zero slack, no gap.
+    // Re-fits on width change (orientation); keyboard open changes height only, so the font holds.
+    const fitFont = () => {
+      const host = hostRef.current;
+      if (!host) return;
+      if (!mirror) {                                   // shell: fixed readable font; cols are driven to fit, not font
+        if (term.options.fontSize !== SHELL_FS) { term.options.fontSize = SHELL_FS; try { term.refresh(0, term.rows - 1); } catch { /* */ } }
+        return;
+      }
+      const availW = host.clientWidth - 12;            // host has 6px padding on each side
+      if (availW <= 0) return;
+      const fs = fitFontSize(availW, term.cols || 80);  // size the font to the CURRENT pane cols
+      if (term.options.fontSize !== fs) {
+        term.options.fontSize = fs;                    // xterm re-measures cells on the next render
+        try { term.refresh(0, term.rows - 1); } catch { /* */ }
+      }
+    };
+    // SHELL sizing (one-shot): drive the blank shell's pane to as many cols as fit the width at SHELL_FS, and
+    // enough rows to fill the host — so it reads like a normal terminal (wraps, no h-scroll) at a readable font,
+    // instead of the mirror's 100-col cram. One-shot (guarded): once set, the keyboard opening just scrolls the
+    // terminal (no row re-fit), and the pane's size event round-trips back to xterm so the two stay matched.
+    let shellSized = false;
+    const resizeShellOnce = () => {
+      if (mirror || shellSized || !interactive) return;
+      const sid = sidRef.current;
+      const host = hostRef.current, root = rootRef.current, block = blockRef.current, el = term.element;
+      if (!sid || !host || !root || !block || !el || !term.rows) return;
+      const availW = host.clientWidth - 12;
+      const cols = Math.max(20, Math.min(100, Math.floor(availW / (SHELL_FS * CHAR_RATIO))));
+      const cellPx = el.offsetHeight / term.rows;                 // current cell height at SHELL_FS
+      const chrome = block.offsetHeight - host.offsetHeight;      // key-bar + composer (non-terminal)
+      const avail = root.clientHeight - chrome - 12;
+      const rows = cellPx > 0 ? Math.max(8, Math.min(60, Math.floor(avail / cellPx))) : 24;
+      if (!(cols > 0)) return;
+      shellSized = true;
+      fetch(`${apiBase}/${encodeURIComponent(sid)}/resize`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ cols, rows }),
+      }).catch(() => {});
+    };
+    // SLIDE (the dead-band kill, Schyler's Option 2). The terminal+key-bar+composer are ONE contiguous,
+    // NATURAL-height block (host is flex:0 0 auto below — it no longer fills, so there is zero band between
+    // the last terminal row and the key-bar). The block top-anchors under the header; any viewport slack
+    // sits BELOW the composer. When the keyboard opens (visualViewport → the section, hence our root, gets
+    // SHORTER) the block can't fit, so we TRANSLATE it up by exactly the overflow: the composer + live
+    // prompt ride just above the keyboard and the TOP of the terminal slides under the header (clipped by
+    // root's overflow:hidden). A transform — no font refit, no row-squeeze, no reflow jank.
+    const slide = () => {
+      const root = rootRef.current, block = blockRef.current;
+      if (!root || !block) return;
+      const overflow = Math.max(0, block.offsetHeight - root.clientHeight);
+      block.style.transform = overflow > 0 ? `translateY(${-overflow}px)` : 'none';
+    };
+    // FILL the host (rows) + drive the pane to TARGET_MIRROR_COLS (bigger fit-to-width font). The head's
+    // alt-screen TUI draws exactly pane-many rows, so we ask the relay to make the mirrored window
+    // TARGET_MIRROR_COLS wide and tall enough to fill — still NO horizontal scroll (cols are sized to the
+    // width). desiredRows = how many rows fit the terminal's share of the KEYBOARD-CLOSED layout, at the
+    // font fit-to-width WOULD pick for TARGET cols. NOT recomputed while the keyboard is open (spec: never
+    // shrink rows — #72's slide tucks the top under the header instead). Converges in 1 POST (+ at most one
+    // ±1-2 row rounding correction); cols are pinned to TARGET and never oscillate.
+    let sized = false;                                 // set once the first size event lands (real pane cols)
+    const resizeMirror = () => {
+      if (kind !== 'pane' || !interactive || !sized) return;   // wait for real pane cols (not xterm's 80)
+      const sid = sidRef.current;
+      const root = rootRef.current, block = blockRef.current, host = hostRef.current, el = term.element;
+      if (!sid || !root || !block || !host || !el || !term.rows) return;
+      const vv = window.visualViewport;                // keyboard open → don't recompute (would shrink rows)
+      if (vv && window.innerHeight - vv.height > 100) return;
+      const curFs = (term.options.fontSize as number) || 1;
+      const cellPerFs = (el.offsetHeight / term.rows) / curFs;   // renderer cell-height per font-px (stable across sizes)
+      // Drive the pane to TARGET_MIRROR_COLS. Project the cell height for the font fit-to-width WOULD pick
+      // at that col count (bigger cells → fewer rows), and derive rows from THAT — so the single POST is
+      // {cols:TARGET, rows: rowsForTheTargetFont}. After the relay reflows the pane + the size event returns
+      // TARGET cols, fitFont re-sizes the font to exactly this projection and rows already (nearly) match →
+      // no 120→rows→re-rows oscillation. (CHAR_RATIO/formula shared with fitFont; the only residual is the
+      // renderer's integer cell-height rounding → at most one ±1-2 row corrective POST, never a col bounce.)
+      const availW = host.clientWidth - 12;
+      const projCellPx = cellPerFs * fitFontSize(availW, TARGET_MIRROR_COLS);
+      const chrome = block.offsetHeight - host.offsetHeight;   // controls + key-bar + composer (non-terminal)
+      const avail = root.clientHeight - chrome - 12;   // px for terminal CONTENT (host has 6px top+bottom pad)
+      if (!(projCellPx > 0) || avail <= 0) return;     // mid-layout / not painted → skip this measurement
+      const want = Math.max(10, Math.min(160, Math.floor(avail / projCellPx)));
+      const atTarget = term.cols === TARGET_MIRROR_COLS;
+      if (atTarget && (want === term.rows || want === lastRowsRef.current)) return;   // converged / already asked
+      lastRowsRef.current = want;
+      fetch(`${apiBase}/${encodeURIComponent(sid)}/resize`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ cols: TARGET_MIRROR_COLS, rows: want }),   // drive cols to the target + filled rows
+      }).catch(() => {});
+    };
+    // DEBOUNCE the row-resize: measure once after layout SETTLES (300ms), not on every paint/relayout —
+    // a mid-paint or feedback-loop measurement (the POST→pane-grow→size-event→re-measure cycle) produced
+    // unstable row-counts. Coalescing to the settled value makes it converge in one resize.
+    let rzTimer: ReturnType<typeof setTimeout> | undefined;
+    const resizeMirrorSoon = () => { clearTimeout(rzTimer); rzTimer = setTimeout(resizeMirror, 300); };
+    let slideQ = false;                                // rAF-coalesce so a busy stream re-slides once/frame
+    const slideSoon = () => { if (slideQ) return; slideQ = true; requestAnimationFrame(() => { slideQ = false; slide(); }); };
+    const relayout = () => { fitFont(); slide(); };    // width-refit + slide; rows are recomputed separately
+    requestAnimationFrame(relayout);                   // once the host has a measured width
+    // Recompute mirror ROWS only on STABLE triggers — orientation (window resize) — NOT on every
+    // ResizeObserver reflow (those fire mid-paint / on the keyboard and produced unstable counts). The
+    // first measurement is kicked by the size event below (once the real pane cols are known + painted).
+    const onWinResize = () => { relayout(); if (mirror) resizeMirrorSoon(); else { shellSized = false; requestAnimationFrame(resizeShellOnce); } };
+    window.addEventListener('resize', onWinResize);
+    // observe HOST width (→ fitFont) AND root height (→ slide: the section shrinks under the keyboard).
+    const ro = new ResizeObserver(() => requestAnimationFrame(relayout));
+    ro.observe(hostRef.current);
+    if (rootRef.current) ro.observe(rootRef.current);
+    term.onRender(slideSoon);                          // terminal painted / changed height → re-slide (coalesced)
+
+    // touch-drag → wheel-scroll: convert a vertical finger drag into SGR wheel events for natural
+    // scrolling on mobile (xterm won't generate wheel from touch, and alt-screen has no scrollback).
+    const host = hostRef.current;
+    let lastY: number | null = null, accum = 0;
+    const onTS = (e: TouchEvent) => { if (e.touches.length === 1) { lastY = e.touches[0].clientY; accum = 0; } };
+    const onTM = (e: TouchEvent) => {
+      if (lastY == null || e.touches.length !== 1) return;
+      const y = e.touches[0].clientY; accum += y - lastY; lastY = y;
+      const STEP = 15;                        // ≈ one line-height of drag per wheel tick → ~1:1 feel
+      const n = Math.trunc(accum / STEP);     // ticks this move is worth (finger down → up = earlier)
+      if (n !== 0) {
+        // ONE batched POST of |n| wheel sequences. Proven on a real head to scroll N lines; rapid
+        // SEPARATE single-tick POSTs collapsed to ~1 effective scroll, which is why a drag moved 1 line.
+        sendWheel(n > 0 ? 'up' : 'down', Math.abs(n));
+        accum -= n * STEP;
+        e.preventDefault(); e.stopPropagation();   // claim from page scroll + xterm's touch/mouse handling
+      }
+    };
+    const onTE = () => { lastY = null; };
+    if (interactive && host) {
+      // capture phase so we beat xterm's own touch handlers to the vertical-drag gesture
+      host.addEventListener('touchstart', onTS, { passive: false, capture: true });
+      host.addEventListener('touchmove', onTM, { passive: false, capture: true });
+      host.addEventListener('touchend', onTE, { capture: true });
+    }
+
+    // SSE stream with a VISIBLE reconnect state (audit 2026-07-02: a mid-session transport drop
+    // left the terminal silently frozen — onerror was a no-op with no indicator). The browser
+    // auto-retries transient drops (readyState CONNECTING → show "reconnecting…"); a FATAL close
+    // (readyState CLOSED, e.g. an SSO 4xx after token expiry) never auto-retries, so we re-open
+    // manually with bounded backoff, and surface "stream lost" if that too runs dry.
+    let retries = 0;
+    let retryTimer: number | undefined;
+    const openStream = () => {
+      const es = new EventSource(`${apiBase}/${encodeURIComponent(sess.sid)}/stream`);
+      es.onopen = () => { retries = 0; setStream('live'); };
+      es.onmessage = (e) => {
+        // raw PTY bytes — let xterm render cursor/scrollback/ANSI natively (no repaint, no decode)
+        try { term.write(b64bytes(e.data)); } catch { /* */ }
+      };
+      es.addEventListener('size', (e) => {
+        const [c, r] = (e as MessageEvent).data.split('x').map(Number);
+        if (c > 0 && r > 0) { sized = true; try { term.resize(c, r); } catch { /* */ } relayout(); if (mirror) resizeMirrorSoon(); else requestAnimationFrame(resizeShellOnce); }   // real cols known → (re)compute rows
+      });
+      es.addEventListener('closed', () => { closeSession(); });
+      es.onerror = () => {
+        if (es.readyState === EventSource.CLOSED) {
+          es.close();
+          if (retries < 5) {
+            retries += 1;
+            setStream('reconnecting');
+            retryTimer = window.setTimeout(openStream, Math.min(8000, 500 * 2 ** retries));
+          } else {
+            setStream('lost');
+          }
+        } else {
+          setStream('reconnecting');   // browser is auto-retrying; the relay re-streams on reconnect
+        }
+      };
+      esRef.current = es;
+    };
+    setStream('live');
+    openStream();
+
+    return () => {
+      window.removeEventListener('resize', onWinResize);
+      clearTimeout(rzTimer);
+      clearTimeout(retryTimer);
+      ro.disconnect();
+      if (interactive && host) {
+        host.removeEventListener('touchstart', onTS, { capture: true });
+        host.removeEventListener('touchmove', onTM, { capture: true });
+        host.removeEventListener('touchend', onTE, { capture: true });
+      }
+      teardownXterm();
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [sess?.sid, interactive]);
+
+  const toggleScrub = async () => {
+    if (!sess) return;
+    const next = !sess.scrub;
+    setSess({ ...sess, scrub: next });
+    try {
+      await fetch(`${apiBase}/${encodeURIComponent(sess.sid)}/scrub`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ on: next }),
+      });
+    } catch { /* */ }
+  };
+
+  const connecting = active && !sess;
+  // SSE transport state — 'reconnecting' while a drop is being retried (browser auto-retry or our
+  // bounded manual re-open), 'lost' when retries ran dry. Anything but 'live' overlays a chip so a
+  // frozen mirror can never pass for a live one.
+  const [stream, setStream] = useState<'live' | 'reconnecting' | 'lost'>('live');
+
+  return (
+    // ROOT = the clip viewport: its height tracks the section's flex box (which the visualViewport shrinks
+    // when the keyboard opens). overflow:hidden clips the terminal top that the BLOCK's translate slides
+    // up under the header.
+    <div ref={rootRef} style={{ height: '100%', minHeight: 0, overflow: 'hidden', position: 'relative' }}>
+      {/* touch-action: pan-x pinch-zoom — KEEP pan-x even though we now fit-to-width (nothing to pan): it's
+          what actually delivers single-finger VERTICAL drags to our capture-phase touchmove handler (verified:
+          pan-x pinch-zoom = touch-scroll works 6/6; pinch-zoom alone = 0 touchmoves, dead). Pinch-to-read
+          preserved; overscroll-behavior:contain stops the drag chaining to the deck swipe / dragging the page. */}
+      <style>{`.hq-term-host,.hq-term-host *{touch-action:pan-x pinch-zoom !important}
+        /* keep the terminal at its NATURAL (fit-to-width) height — never let the flex column stretch it. */
+        .hq-term-host>.xterm{flex:0 0 auto !important}
+        .hq-term-mirror .xterm-cursor,.hq-term-mirror .xterm-cursor-outline{display:none !important;border:0 !important;background:transparent !important}`}</style>
+      {/* BLOCK = header(controls) → terminal → key-bar → composer as ONE contiguous, NATURAL-height column.
+          Top-anchored under the header (slack, if any, sits BELOW the composer). `slide()` sets translateY
+          to ride the composer just above the keyboard when the section shrinks. */}
+      <div ref={blockRef} style={{ display: 'flex', flexDirection: 'column', willChange: 'transform' }}>
+      {showControls && sess && (
+        <div style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '4px 6px 6px', flex: '0 0 auto' }}>
+          {kind === 'pane' && (
+            <label style={{ display: 'inline-flex', alignItems: 'center', gap: 5, fontSize: 10, color: C.muted, cursor: 'pointer' }}>
+              <input type="checkbox" checked={sess.scrub} onChange={toggleScrub} /> scrub secrets
+            </label>
+          )}
+          {kind === 'shell' && <span style={{ fontSize: 10, color: C.amber }}>blank shell · $HOME · full access</span>}
+          {onClose && (
+            <button type="button" onClick={() => { closeSession(); onClose(); }}
+              style={{ marginLeft: 'auto', fontFamily: C.mono, fontSize: 11, padding: '3px 11px', borderRadius: C.radius, cursor: 'pointer', border: `1px solid ${C.red}`, background: 'rgba(255,107,107,.08)', color: C.red }}>
+              ⏹ close{kind === 'shell' ? ' + kill shell' : ''}
+            </button>
+          )}
+        </div>
+      )}
+
+      {/* xterm host — sizes to the terminal's NATURAL fit-to-width height (flex:0 0 auto: it does NOT fill).
+          That kills the dead band: the key-bar butts directly against the last terminal row. The block (not
+          the host) owns vertical positioning, via `slide()`. minHeight keeps room for the "connecting…"
+          overlay before the first paint. */}
+      <div ref={hostRef} className={`hq-term-host${kind === 'pane' ? ' hq-term-mirror' : ''}`} style={{ flex: '0 0 auto', minHeight: 96, background: '#04070a', borderRadius: C.radius, overflowX: 'hidden', overflowY: 'hidden', overscrollBehavior: 'contain', padding: 6, position: 'relative', touchAction: 'pan-x pinch-zoom', display: 'flex', flexDirection: 'column' }}>
+        {connecting && <div style={{ position: 'absolute', inset: 0, display: 'flex', alignItems: 'center', justifyContent: 'center', color: C.faint, fontFamily: C.mono, fontSize: 12 }}>connecting…</div>}
+        {!connecting && sess && stream !== 'live' && (
+          <div style={{ position: 'absolute', top: 4, right: 6, zIndex: 2, display: 'inline-flex', alignItems: 'center', gap: 4,
+            padding: '2px 6px', border: `1px solid ${stream === 'lost' ? C.red : C.amber}`, borderRadius: C.radius,
+            color: stream === 'lost' ? C.red : C.amber, fontFamily: C.mono, fontSize: 10,
+            background: 'rgba(4,7,10,.85)' }}>
+            {stream === 'lost' ? '✗ stream lost — reopen the terminal' : '⚡ reconnecting…'}
+          </div>
+        )}
+      </div>
+
+      {interactive && sess && (
+        <>
+          {/* When the in-app keyboard is open it IS the input — hide the key-bar (Esc/Tab/Ctrl/arrows are
+              duplicated on it) AND the composer (whose <input> summons the native keyboard, so all three
+              stacked). Closed → key-bar (carrying the ⌨ toggle) + composer; the keyboard's ▾ closes it. */}
+          {!kbOpen && (<>
+          {/* key-bar — phone-missing keys (Esc/Tab/arrows/Ctrl-combos); horizontally scrollable */}
+          <div style={{ display: 'flex', gap: 5, padding: '6px 2px 0', overflowX: 'auto', flex: '0 0 auto' }}>
+            <button type="button" onClick={() => setKbOpen((o) => !o)} title="in-app keyboard (no native keyboard)"
+              style={{ flexShrink: 0, fontFamily: C.mono, fontSize: 13, padding: '6px 11px', borderRadius: C.radius, cursor: 'pointer',
+                border: `1px solid ${kbOpen ? C.green : C.line2}`, background: kbOpen ? 'rgba(34,255,106,.12)' : C.raised, color: kbOpen ? C.green : C.ink }}>⌨</button>
+            <button type="button" onClick={toggleCtrl}
+              title="sticky Ctrl — next letter is sent as its control byte"
+              style={{ flexShrink: 0, fontFamily: C.mono, fontSize: 12, padding: '6px 11px', borderRadius: C.radius, cursor: 'pointer',
+                border: `1px solid ${ctrlArmed ? C.amber : C.line2}`, background: ctrlArmed ? 'rgba(255,207,92,.16)' : C.raised, color: ctrlArmed ? C.amber : C.ink }}>Ctrl</button>
+            <button type="button" onClick={() => sendWheel('up')} title="scroll the head's view up"
+              style={{ flexShrink: 0, fontFamily: C.mono, fontSize: 13, padding: '6px 10px', borderRadius: C.radius, cursor: 'pointer', border: `1px solid ${C.line2}`, background: C.raised, color: C.ink }}>⤒</button>
+            <button type="button" onClick={() => sendWheel('down')} title="scroll the head's view down"
+              style={{ flexShrink: 0, fontFamily: C.mono, fontSize: 13, padding: '6px 10px', borderRadius: C.radius, cursor: 'pointer', border: `1px solid ${C.line2}`, background: C.raised, color: C.ink }}>⤓</button>
+            {KEYBAR.map((k) => (
+              <button key={k.label} type="button" onClick={() => sendBytes(k.bytes)}
+                style={{ flexShrink: 0, fontFamily: C.mono, fontSize: 12, padding: '6px 10px', borderRadius: C.radius, cursor: 'pointer',
+                  border: `1px solid ${C.line2}`, background: C.raised, color: C.ink }}>{k.label}</button>
+            ))}
+          </div>
+
+          {kind === 'shell' ? (
+            /* blank SHELL — a LIVE keystroke capture, not a message box. The field stays empty (it only
+               summons the native keyboard + forwards keystrokes straight to the PTY); your text, the `$`
+               prompt and the cursor all live in the terminal ABOVE, because the shell echoes what it
+               receives. onInput forwards printable text (handles autocorrect/paste batches) then clears;
+               onKeyDown forwards the keys that emit no input data (Enter/Backspace/Tab/Esc/arrows). */
+            <div style={{ display: 'flex', gap: 6, padding: '7px 2px 0', flex: '0 0 auto' }}>
+              <input
+                defaultValue="" autoFocus inputMode="text" autoCapitalize="off" autoCorrect="off" spellCheck={false}
+                placeholder="type — goes live to the shell ↑"
+                onInput={(e) => { const el = e.target as HTMLInputElement; if (el.value) { sendBytes(el.value); el.value = ''; } }}
+                onKeyDown={(e) => {
+                  const m: Record<string, string> = { Enter: '\r', Backspace: '\x7f', Tab: '\t', Escape: '\x1b',
+                    ArrowUp: '\x1b[A', ArrowDown: '\x1b[B', ArrowLeft: '\x1b[D', ArrowRight: '\x1b[C' };
+                  if (m[e.key]) { sendBytes(m[e.key]); e.preventDefault(); }
+                }}
+                style={{ flex: 1, background: '#04070a', color: C.green, border: `1px solid ${C.line2}`, borderRadius: C.radius, fontFamily: C.mono, fontSize: 16, padding: '8px 9px', caretColor: C.green }} />
+            </div>
+          ) : (
+            /* head-view MIRROR — the SHARED draft (chat⟷TUI); type a message + Send */
+            <div style={{ display: 'flex', gap: 6, padding: '7px 2px 0', flex: '0 0 auto' }}>
+              <input value={draft} onChange={(e) => setDraft(e.target.value)} onKeyDown={(e) => { if (e.key === 'Enter') sendLine(); }}
+                placeholder={`message ${sessionTarget ?? ''}…`} autoCapitalize="off" autoCorrect="off" spellCheck={false}
+                style={{ flex: 1, background: C.raised, color: C.ink, border: `1px solid ${C.line2}`, borderRadius: C.radius, fontFamily: C.mono, fontSize: 16, padding: '8px 9px' }} />
+              <button type="button" onClick={sendLine}
+                style={{ fontFamily: C.mono, fontSize: 12, padding: '8px 14px', borderRadius: C.radius, cursor: 'pointer', border: `1px solid ${C.green}`, background: 'rgba(34,255,106,.10)', color: C.green }}>Send ↵</button>
+            </div>
+          )}
+          </>)}
+
+          {/* shared-draft strip (above the in-app keyboard) — persists until Send; the SAME draft as the chat
+              composer, so a message begun in chat continues here (or vice versa). Send fires it as a message.
+              A blank shell has no draft (the in-app keyboard routes every key LIVE), so skip it there. */}
+          {kbOpen && kind !== 'shell' && (
+            <div style={{ flex: '0 0 auto', display: 'flex', alignItems: 'center', gap: 6, padding: '5px 6px',
+              background: 'rgba(34,255,106,.05)', borderTop: `1px solid ${C.line}` }}>
+              <div style={{ flex: 1, minWidth: 0, fontFamily: C.mono, fontSize: 13, color: C.ink, whiteSpace: 'nowrap',
+                overflow: 'hidden', textOverflow: 'ellipsis', direction: 'rtl', textAlign: 'left' }}>
+                <span style={{ direction: 'ltr', unicodeBidi: 'plaintext' }}>❯ {draft || <span style={{ color: C.faint }}>{`message ${sessionTarget ?? ''}…`}</span>}</span>
+                <span style={{ direction: 'ltr', color: C.green, animation: 'hq-blink 1s step-end infinite' }}>▊</span>
+              </div>
+              <button type="button" onClick={() => void sendDraft()} disabled={!draft.trim()}
+                style={{ flex: '0 0 auto', fontFamily: C.mono, fontSize: 12, padding: '6px 12px', borderRadius: C.radius,
+                  cursor: draft.trim() ? 'pointer' : 'default', border: `1px solid ${draft.trim() ? C.green : C.line2}`,
+                  background: draft.trim() ? 'rgba(34,255,106,.12)' : C.raised, color: draft.trim() ? C.green : C.faint }}>Send ↵</button>
+            </div>
+          )}
+          {/* in-app full keyboard (collapsible). onKbKey routes TEXT → the shared draft, SPECIAL keys → live. */}
+          {kbOpen && <TuiKeyboard onBytes={onKbKey} ctrlArmed={ctrlArmed} onToggleCtrl={toggleCtrl} onHide={() => setKbOpen(false)} />}
+        </>
+      )}
+      </div>
+    </div>
+  );
+}
