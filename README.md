@@ -29,6 +29,18 @@ Upgrade both apps with a version bump + `npm update`. (Or a git submodule if you
 All verbatim from HQ, dependency-free beyond React. `sanitizeUrl.test.ts` ships too — the one piece of
 the console with real test coverage; keep it green.
 
+## v0.4 — comprehensive accessory bar + sticky modifiers + tmux chords
+
+The TUI accessory bar is now full raw-terminal grade (for HQ's WSL/tmux panes):
+- **Sticky modifiers Ctrl / Alt / ⇧** — arm one or several; the next key (from the bar OR the native
+  keyboard) composes then auto-disarms. Ctrl→control byte (⌃A…⌃Z, ⌃Space=NUL), Alt→ESC-prefix,
+  Shift→shifted/upper. So any `Ctrl+X` / `Alt+X` the phone keyboard can't emit is reachable.
+- **tmux ⌃B prefix** button (+ Shift+Tab→back-tab) and an expandable **⋯ tray**: Home/End/PgUp/PgDn/
+  Del/Ins, one-tap ^C…^W, tmux chords (new-window/split/zoom/pane-nav/detach/copy), F1–F12, and the
+  symbols phones bury (`| ~ \` \\ / { } [ ] < > _ # $ * &`).
+The native keyboard's `onKeyDown`/`onInput` route through the same modifier state, so composing works
+whether you tap a bar key or type. `HeadTerminal`'s prop surface is unchanged from v0.3.
+
 ## v0.3 — one terminal, one live keyboard (⚠️ breaking)
 
 The TUI input model was overhauled (Schyler, 2026-07-03): the dual message-box + collapsible

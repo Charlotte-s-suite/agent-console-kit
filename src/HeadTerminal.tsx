@@ -25,20 +25,58 @@ import { C } from './render/tokens';
 // already carries real terminal bytes).
 const b64bytes = (b64: string): Uint8Array => Uint8Array.from(atob(b64), (ch) => ch.charCodeAt(0));
 
-// accessory bar — ONLY the keys a phone's native keyboard can't produce (letters/numbers come from
-// the native keyboard itself). Every tap sends its bytes LIVE to the PTY.
-const KEYBAR: { label: string; bytes: string }[] = [
+// ── Accessory-bar key sets. The native keyboard supplies letters/numbers; the bar supplies what a
+// phone keyboard can't, all sent LIVE to the PTY. Comprehensive enough for raw WSL/tmux TUIs. ──
+type Key = { label: string; bytes: string; title?: string };
+
+// primary row — always visible: nav + tab/back-tab + the tmux prefix.
+const NAV_KEYS: Key[] = [
   { label: 'Esc', bytes: '\x1b' }, { label: 'Tab', bytes: '\t' },
+  { label: '⇧Tab', bytes: '\x1b[Z', title: 'shift+tab (back-tab)' },
   { label: '←', bytes: '\x1b[D' }, { label: '↓', bytes: '\x1b[B' },
   { label: '↑', bytes: '\x1b[A' }, { label: '→', bytes: '\x1b[C' },
-  { label: '⌃C', bytes: '\x03' }, { label: '⌃D', bytes: '\x04' }, { label: '⌃Z', bytes: '\x1a' },
-  { label: '|', bytes: '|' }, { label: '~', bytes: '~' }, { label: '-', bytes: '-' },
 ];
+// tmux PREFIX (Ctrl-B) — tap it, then tap the next key (⌃B c = new window, ⌃B % = split, ⌃B ← = pane…).
+const TMUX_PREFIX = '\x02';
+// tray: extended navigation / editing.
+const NAV2_KEYS: Key[] = [
+  { label: 'Home', bytes: '\x1b[H' }, { label: 'End', bytes: '\x1b[F' },
+  { label: 'PgUp', bytes: '\x1b[5~' }, { label: 'PgDn', bytes: '\x1b[6~' },
+  { label: 'Del', bytes: '\x1b[3~' }, { label: 'Ins', bytes: '\x1b[2~' },
+  { label: '⌫', bytes: '\x7f', title: 'backspace' },
+];
+// tray: common one-tap control combos.
+const CTRL_KEYS: Key[] = [
+  { label: '^C', bytes: '\x03' }, { label: '^D', bytes: '\x04' }, { label: '^Z', bytes: '\x1a' },
+  { label: '^L', bytes: '\x0c' }, { label: '^R', bytes: '\x12' }, { label: '^A', bytes: '\x01' },
+  { label: '^E', bytes: '\x05' }, { label: '^K', bytes: '\x0b' }, { label: '^U', bytes: '\x15' },
+  { label: '^W', bytes: '\x17' }, { label: '^G', bytes: '\x07' },
+];
+// tray: tmux chords (prefix already applied — one tap = ⌃B then the key).
+const TMUX_KEYS: Key[] = [
+  { label: 'c·win', bytes: '\x02c', title: 'new window' }, { label: '%·vsplit', bytes: '\x02%' },
+  { label: '"·hsplit', bytes: '\x02"' }, { label: 'z·zoom', bytes: '\x02z' },
+  { label: 'o·pane', bytes: '\x02o', title: 'next pane' }, { label: 'n·next', bytes: '\x02n' },
+  { label: 'p·prev', bytes: '\x02p' }, { label: 'd·detach', bytes: '\x02d' },
+  { label: '[·copy', bytes: '\x02[', title: 'copy/scroll mode' }, { label: 'x·kill', bytes: '\x02x' },
+];
+// tray: function keys (F1-F4 = SS3, F5-F12 = CSI).
+const FN_KEYS: Key[] = [
+  { label: 'F1', bytes: '\x1bOP' }, { label: 'F2', bytes: '\x1bOQ' }, { label: 'F3', bytes: '\x1bOR' },
+  { label: 'F4', bytes: '\x1bOS' }, { label: 'F5', bytes: '\x1b[15~' }, { label: 'F6', bytes: '\x1b[17~' },
+  { label: 'F7', bytes: '\x1b[18~' }, { label: 'F8', bytes: '\x1b[19~' }, { label: 'F9', bytes: '\x1b[20~' },
+  { label: 'F10', bytes: '\x1b[21~' }, { label: 'F11', bytes: '\x1b[23~' }, { label: 'F12', bytes: '\x1b[24~' },
+];
+// tray: symbols a phone keyboard buries under sub-menus.
+const SYM_KEYS: Key[] = ['|', '~', '`', '\\', '/', '{', '}', '[', ']', '<', '>', '_', '#', '$', '*', '&']
+  .map((s) => ({ label: s, bytes: s }));
 
 // native-keyboard keys that emit no onInput data — forwarded to the PTY as their control sequences.
+// Shift+Tab is intercepted separately (→ back-tab \x1b[Z).
 const SPECIAL_KEYS: Record<string, string> = {
   Enter: '\r', Backspace: '\x7f', Tab: '\t', Escape: '\x1b',
   ArrowUp: '\x1b[A', ArrowDown: '\x1b[B', ArrowLeft: '\x1b[D', ArrowRight: '\x1b[C',
+  Home: '\x1b[H', End: '\x1b[F', PageUp: '\x1b[5~', PageDown: '\x1b[6~', Delete: '\x1b[3~',
 };
 
 type Sess = { sid: string; scrub: boolean };
@@ -85,8 +123,23 @@ export default function HeadTerminal({
   openDelayMs = 0, showControls = true, onClose, onError,
 }: HeadTerminalProps) {
   const [sess, setSess] = useState<Sess | null>(null);
-  const [ctrlArmed, setCtrlArmed] = useState(false);  // sticky Ctrl (next letter → control byte)
+  // sticky modifiers — arm one (or several), the NEXT key composes with them then they auto-disarm.
+  // Applies to the accessory char keys AND every keystroke from the native keyboard, so any
+  // Ctrl+X / Alt+X / Shift+X the phone keyboard can't emit is reachable (incl. tmux ⌃B via Ctrl+b).
+  const [ctrlArmed, setCtrlArmed] = useState(false);
+  const [altArmed, setAltArmed] = useState(false);
+  const [shiftArmed, setShiftArmed] = useState(false);
+  const [trayOpen, setTrayOpen] = useState(false);    // expandable "more keys" tray
+  const altRef = useRef(false);
+  const shiftRef = useRef(false);
   const toggleCtrl = () => { const n = !ctrlRef.current; ctrlRef.current = n; setCtrlArmed(n); };
+  const toggleAlt = () => { const n = !altRef.current; altRef.current = n; setAltArmed(n); };
+  const toggleShift = () => { const n = !shiftRef.current; shiftRef.current = n; setShiftArmed(n); };
+  const disarmMods = () => {
+    if (ctrlRef.current) { ctrlRef.current = false; setCtrlArmed(false); }
+    if (altRef.current) { altRef.current = false; setAltArmed(false); }
+    if (shiftRef.current) { shiftRef.current = false; setShiftArmed(false); }
+  };
 
   const rootRef = useRef<HTMLDivElement | null>(null);   // clip viewport (height = section's flex box)
   const blockRef = useRef<HTMLDivElement | null>(null);  // the contiguous terminal+key-bar+composer block
@@ -168,19 +221,37 @@ export default function HeadTerminal({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // ---- input: forward raw bytes LIVE to the PTY; sticky-Ctrl maps a single letter to its control byte.
-  // Every input path funnels here — the accessory bar, the desktop xterm, and the native-keyboard field.
-  const sendBytes = (data: string) => {
+  // ---- input: the low-level POST of raw bytes LIVE to the PTY. No modifier logic here.
+  const postBytes = (out: string) => {
     const sid = sidRef.current;
-    if (!sid) return;
-    let out = data;
-    if (ctrlRef.current && /^[a-zA-Z]$/.test(data)) {
-      out = String.fromCharCode(data.toLowerCase().charCodeAt(0) & 0x1f);
-      ctrlRef.current = false; setCtrlArmed(false);
-    }
+    if (!sid || !out) return;
     fetch(`${apiBase}/${encodeURIComponent(sid)}/input`, {
       method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ data: out }),
     }).catch(() => {});
+  };
+
+  // send a COMPLETE escape sequence (arrow, F-key, tmux chord, ⌃C…) — already fully formed. An armed
+  // Alt still prefixes it with ESC (meta); Ctrl/Shift don't recombine a ready sequence. Disarms after.
+  const sendSeq = (seq: string) => {
+    postBytes(altRef.current ? '\x1b' + seq : seq);
+    disarmMods();
+  };
+
+  // send a single CHARACTER through the armed sticky modifiers (used by the native keyboard and the
+  // symbol keys): Ctrl→control byte, Shift→upper/shifted, Alt→ESC-prefixed. Modifiers combine.
+  const sendChar = (ch: string) => {
+    let out = ch;
+    if (shiftRef.current && /^[a-z]$/.test(out)) out = out.toUpperCase();
+    if (ctrlRef.current && /^[a-zA-Z]$/.test(out)) out = String.fromCharCode(out.toLowerCase().charCodeAt(0) & 0x1f);
+    else if (ctrlRef.current && out === ' ') out = '\x00';   // Ctrl+Space → NUL
+    if (altRef.current) out = '\x1b' + out;
+    postBytes(out);
+    disarmMods();
+  };
+
+  // Back-compat alias used by the desktop xterm keystroke path (raw bytes, honor sticky Ctrl on a letter).
+  const sendBytes = (data: string) => {
+    if (data.length === 1) sendChar(data); else sendSeq(data);
   };
 
   // Alt-screen TUIs (Claude Code) scroll via MOUSE WHEEL, not terminal scrollback — and a phone has
@@ -191,7 +262,7 @@ export default function HeadTerminal({
     const col = t ? Math.max(1, t.cols >> 1) : 10;   // center coord — within any pane's scroll region
     const row = t ? Math.max(1, t.rows >> 1) : 8;
     const btn = dir === 'up' ? 64 : 65;
-    sendBytes(`\x1b[<${btn};${col};${row}M`.repeat(ticks));
+    postBytes(`\x1b[<${btn};${col};${row}M`.repeat(ticks));   // scroll is modifier-neutral
   };
 
   // ---- xterm: raw-byte render keyed on the live sid ----------------------------------------------
@@ -488,47 +559,89 @@ export default function HeadTerminal({
         )}
       </div>
 
-      {interactive && sess && (
+      {interactive && sess && (() => {
+        const anyMod = ctrlArmed || altArmed || shiftArmed;
+        const modBtn = (label: string, armed: boolean, onClick: () => void, title: string) => (
+          <button type="button" onMouseDown={(e) => { e.preventDefault(); onClick(); }} title={title}
+            style={{ flexShrink: 0, fontFamily: C.mono, fontSize: 12, padding: '6px 11px', borderRadius: C.radius, cursor: 'pointer',
+              border: `1px solid ${armed ? C.amber : C.line2}`, background: armed ? 'rgba(255,207,92,.18)' : C.raised, color: armed ? C.amber : C.ink }}>{label}</button>
+        );
+        // seq keys are complete sequences (→ sendSeq); char keys compose with modifiers (→ sendChar).
+        const keyBtn = (k: Key, mode: 'seq' | 'char') => (
+          <button key={k.label} type="button" onMouseDown={(e) => { e.preventDefault(); mode === 'char' ? sendChar(k.bytes) : sendSeq(k.bytes); }}
+            title={k.title || `send ${k.label}`}
+            style={{ flexShrink: 0, fontFamily: C.mono, fontSize: 12, padding: '6px 10px', borderRadius: C.radius, cursor: 'pointer',
+              border: `1px solid ${C.line2}`, background: C.raised, color: C.ink, whiteSpace: 'nowrap' }}>{k.label}</button>
+        );
+        const groupSep = () => <span style={{ flexShrink: 0, width: 1, alignSelf: 'stretch', margin: '2px 3px', background: C.line }} />;
+        return (
         <>
-          {/* ACCESSORY bar — ONLY the keys a native keyboard can't produce, all LIVE to the PTY.
-              Sticky Ctrl + scroll + Esc/Tab/arrows/pipe/^C… Horizontally scrollable; pins just above
-              the native keyboard's input below it. */}
+          {/* ACCESSORY bar — everything a phone keyboard can't emit, LIVE to the PTY. Sticky modifiers
+              (Ctrl/Alt/Shift) compose with the next key from the bar OR the native keyboard, so any
+              Ctrl+X / Alt+X and the tmux ⌃B-prefix chords are reachable. "⋯" expands the full tray. */}
           <div style={{ display: 'flex', gap: 5, padding: '6px 2px 0', overflowX: 'auto', flex: '0 0 auto' }}>
-            <button type="button" onClick={toggleCtrl}
-              title="sticky Ctrl — the next letter is sent as its control byte (⌃A…⌃Z)"
-              style={{ flexShrink: 0, fontFamily: C.mono, fontSize: 12, padding: '6px 11px', borderRadius: C.radius, cursor: 'pointer',
-                border: `1px solid ${ctrlArmed ? C.amber : C.line2}`, background: ctrlArmed ? 'rgba(255,207,92,.16)' : C.raised, color: ctrlArmed ? C.amber : C.ink }}>Ctrl</button>
-            <button type="button" onClick={() => sendWheel('up')} title="scroll the terminal view up"
+            {modBtn('Ctrl', ctrlArmed, toggleCtrl, 'sticky Ctrl — next key sends its control byte (⌃A…⌃Z, ⌃Space=NUL)')}
+            {modBtn('Alt', altArmed, toggleAlt, 'sticky Alt/Meta — next key is ESC-prefixed')}
+            {modBtn('⇧', shiftArmed, toggleShift, 'sticky Shift — next key is shifted/upper')}
+            {groupSep()}
+            {NAV_KEYS.map((k) => keyBtn(k, 'seq'))}
+            <button type="button" onMouseDown={(e) => { e.preventDefault(); postBytes(TMUX_PREFIX); disarmMods(); }}
+              title="tmux prefix (Ctrl-B) — then tap the next key: c=new window, %=split, ←→=pane, z=zoom…"
+              style={{ flexShrink: 0, fontFamily: C.mono, fontSize: 12, padding: '6px 10px', borderRadius: C.radius, cursor: 'pointer',
+                border: `1px solid ${C.violet}`, background: 'rgba(167,139,250,.12)', color: C.violet, whiteSpace: 'nowrap' }}>⌃B</button>
+            {groupSep()}
+            <button type="button" onMouseDown={(e) => { e.preventDefault(); sendWheel('up'); }} title="scroll the terminal view up"
               style={{ flexShrink: 0, fontFamily: C.mono, fontSize: 13, padding: '6px 10px', borderRadius: C.radius, cursor: 'pointer', border: `1px solid ${C.line2}`, background: C.raised, color: C.ink }}>⤒</button>
-            <button type="button" onClick={() => sendWheel('down')} title="scroll the terminal view down"
+            <button type="button" onMouseDown={(e) => { e.preventDefault(); sendWheel('down'); }} title="scroll the terminal view down"
               style={{ flexShrink: 0, fontFamily: C.mono, fontSize: 13, padding: '6px 10px', borderRadius: C.radius, cursor: 'pointer', border: `1px solid ${C.line2}`, background: C.raised, color: C.ink }}>⤓</button>
-            {KEYBAR.map((k) => (
-              <button key={k.label} type="button" onMouseDown={(e) => { e.preventDefault(); sendBytes(k.bytes); }} title={`send ${k.label}`}
-                style={{ flexShrink: 0, fontFamily: C.mono, fontSize: 12, padding: '6px 10px', borderRadius: C.radius, cursor: 'pointer',
-                  border: `1px solid ${C.line2}`, background: C.raised, color: C.ink }}>{k.label}</button>
-            ))}
+            {groupSep()}
+            <button type="button" onMouseDown={(e) => { e.preventDefault(); setTrayOpen((o) => !o); }} title="more keys — Home/End/PgUp, F-keys, tmux chords, symbols"
+              style={{ flexShrink: 0, fontFamily: C.mono, fontSize: 13, padding: '6px 11px', borderRadius: C.radius, cursor: 'pointer',
+                border: `1px solid ${trayOpen ? C.green : C.line2}`, background: trayOpen ? 'rgba(34,255,106,.12)' : C.raised, color: trayOpen ? C.green : C.ink }}>⋯</button>
           </div>
+
+          {/* expandable tray — grouped rows: nav/edit · ctrl-combos · tmux chords · function keys · symbols */}
+          {trayOpen && (
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 4, padding: '5px 2px 0', flex: '0 0 auto' }}>
+              <div style={{ display: 'flex', gap: 5, overflowX: 'auto' }}>{NAV2_KEYS.map((k) => keyBtn(k, 'seq'))}</div>
+              <div style={{ display: 'flex', gap: 5, overflowX: 'auto' }}>{CTRL_KEYS.map((k) => keyBtn(k, 'seq'))}</div>
+              <div style={{ display: 'flex', gap: 5, overflowX: 'auto' }}>{TMUX_KEYS.map((k) => keyBtn(k, 'seq'))}</div>
+              <div style={{ display: 'flex', gap: 5, overflowX: 'auto' }}>{FN_KEYS.map((k) => keyBtn(k, 'seq'))}</div>
+              <div style={{ display: 'flex', gap: 5, overflowX: 'auto' }}>{SYM_KEYS.map((k) => keyBtn(k, 'char'))}</div>
+            </div>
+          )}
 
           {/* LIVE native-keyboard input — the single input surface for the terminal. It summons the
               phone's native keyboard and forwards every keystroke straight to the PTY; the field stays
               empty (your text, prompt + cursor render in the terminal ABOVE, echoed by the head/shell).
-              onInput forwards printable text (autocorrect/paste batches) then clears; onKeyDown forwards
-              the keys that emit no input data (Enter/Backspace/Tab/Esc/arrows). Same for pane + shell.
-              onMouseDown on the accessory buttons preventDefault so tapping a key never steals focus
-              (native keyboard stays up). */}
+              onInput composes printable text through the armed modifiers (Ctrl/Alt/Shift) then clears;
+              onKeyDown forwards keys that emit no input data (Enter/Backspace/Tab/Esc/arrows/nav), with
+              Shift+Tab→back-tab. Same for pane + shell. onMouseDown on the accessory buttons
+              preventDefault so tapping a key never steals focus (the native keyboard stays up). */}
           <div style={{ display: 'flex', gap: 6, padding: '7px 2px 0', flex: '0 0 auto' }}>
             <input
               defaultValue="" inputMode="text" autoCapitalize="off" autoCorrect="off" spellCheck={false}
               autoFocus={kind === 'shell'}
-              placeholder={`type — keystrokes go live to ${kind === 'shell' ? 'the shell' : (sessionTarget ?? 'the head')} ↑`}
-              onInput={(e) => { const el = e.target as HTMLInputElement; if (el.value) { sendBytes(el.value); el.value = ''; } }}
-              onKeyDown={(e) => {
-                if (SPECIAL_KEYS[e.key]) { sendBytes(SPECIAL_KEYS[e.key]); e.preventDefault(); }
+              placeholder={anyMod
+                ? `${ctrlArmed ? '⌃' : ''}${altArmed ? '⌥' : ''}${shiftArmed ? '⇧' : ''} armed — next key composes`
+                : `type — keystrokes go live to ${kind === 'shell' ? 'the shell' : (sessionTarget ?? 'the head')} ↑`}
+              onInput={(e) => {
+                const el = e.target as HTMLInputElement;
+                const v = el.value;
+                el.value = '';
+                if (!v) return;
+                if (ctrlRef.current || altRef.current || shiftRef.current) { sendChar(v[0]); if (v.length > 1) postBytes(v.slice(1)); }
+                else postBytes(v);   // fast path — paste/autocorrect batches straight through
               }}
-              style={{ flex: 1, background: '#04070a', color: C.green, border: `1px solid ${ctrlArmed ? C.amber : C.line2}`, borderRadius: C.radius, fontFamily: C.mono, fontSize: 16, padding: '8px 9px', caretColor: C.green }} />
+              onKeyDown={(e) => {
+                if (e.key === 'Tab') { sendSeq(shiftRef.current || e.shiftKey ? '\x1b[Z' : '\t'); e.preventDefault(); return; }
+                if (SPECIAL_KEYS[e.key]) { sendSeq(SPECIAL_KEYS[e.key]); e.preventDefault(); }
+              }}
+              style={{ flex: 1, background: '#04070a', color: anyMod ? C.amber : C.green, border: `1px solid ${anyMod ? C.amber : C.line2}`, borderRadius: C.radius, fontFamily: C.mono, fontSize: 16, padding: '8px 9px', caretColor: C.green }} />
           </div>
         </>
-      )}
+        );
+      })()}
       </div>
     </div>
   );
