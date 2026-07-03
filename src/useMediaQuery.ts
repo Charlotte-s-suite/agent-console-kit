@@ -8,7 +8,9 @@
 
 import { useEffect, useState } from 'react';
 // MOBILE_QUERY inlined from HQ layout.ts to keep the kit self-contained (single source: this file).
-export const MOBILE_QUERY = '(max-width: 720px)';
+// v0.2.1 reconcile: the v0.2.0 seed inlined 720 but HQ's live layout.ts value is MOBILE_MAX=760 —
+// caught in the migrate-HQ-to-kit diff pass before it could shift every HQ mobile breakpoint.
+export const MOBILE_QUERY = '(max-width: 760px)';
 
 /** Reactive `window.matchMedia(query).matches`. SSR-safe (defaults to false). */
 export function useMediaQuery(query: string): boolean {
