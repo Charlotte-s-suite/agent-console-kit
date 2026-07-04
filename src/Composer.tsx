@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
+import type { ReactNode } from 'react';
 import { C } from './render/tokens';
 import type { CommandsResponse, SlashCommand } from './types';
 
@@ -45,10 +46,13 @@ function filterCmds(cmds: SlashCommand[], q: string): SlashCommand[] {
 type SentMsg = { id: string; text: string; route?: string };
 type Attachment = { name: string; host_path: string; image: boolean; preview?: string };
 
-export default function Composer({ sessionTarget, apiBase = '/api/hq', commandsFetcher, onSent, draft: draftProp, onDraft, suggest }:
+export default function Composer({ sessionTarget, apiBase = '/api/hq', commandsFetcher, onSent, draft: draftProp, onDraft, suggest, footer }:
   { sessionTarget: string; apiBase?: string; commandsFetcher?: () => Promise<SlashCommand[]>;
     onSent?: (msg: SentMsg) => void; draft?: string; onDraft?: (v: string) => void;
-    suggest?: string | null }) {
+    suggest?: string | null;
+    // footer: replaces the default keyboard-hints line under the composer with a host-supplied
+    // node (e.g. HQ's StatusLine) — reclaims the row instead of stacking another line below.
+    footer?: ReactNode }) {
   // draft is CONTROLLED when the deck passes it (shared chat⟷TUI draft); else local.
   const [localDraft, setLocalDraft] = useState('');
   const draft = draftProp ?? localDraft;
@@ -267,9 +271,11 @@ export default function Composer({ sessionTarget, apiBase = '/api/hq', commandsF
           </div>
         </div>
       </div>
-      <div style={{ fontSize: 9, color: C.faint, marginTop: 2, fontFamily: C.mono, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
-        ⏎ send · ⇧⏎ newline · / cmds · <span style={{ color: C.amber }}>⚠ drives {sessionTarget} live</span>
-      </div>
+      {footer !== undefined ? footer : (
+        <div style={{ fontSize: 9, color: C.faint, marginTop: 2, fontFamily: C.mono, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
+          ⏎ send · ⇧⏎ newline · / cmds · <span style={{ color: C.amber }}>⚠ drives {sessionTarget} live</span>
+        </div>
+      )}
     </div>
   );
 }
