@@ -100,6 +100,38 @@ export type HeadTerminalProps = {
   showControls?: boolean;        // render the per-session control bar (scrub toggle / close) (default true)
   onClose?: () => void;          // if set, a ⏹ close button is rendered + invoked after closing
   onError?: (msg: string | null) => void;   // surface open/spawn errors to the host chrome
+  predictiveEcho?: 'auto' | 'on' | 'off';   // mosh-style local echo of typed keys (see ECHO below; default
+                                            // 'auto' = coarse-pointer mirrors only — where the RTT hurts)
+};
+
+// ---- predictive (local) echo — the INPUT-path half of the mosh model -----------------------------
+// Over mobile latency a keystroke round-trips phone → relay → tmux → pane redraw → SSE before anything
+// visibly happens; 300-800ms of "did my tap even register?". True grid prediction is impossible for an
+// alt-screen TUI (arbitrary redraws — the roadmap row concedes this), and "stream activity" is useless
+// as confirmation because Claude's spinner repaints continuously. So the honest contract is DELIVERY
+// echo: each key renders in an overlay strip INSTANTLY (underlined = in flight, mosh's convention),
+// turns solid when its /input POST resolves (real delivered-to-PTY confirmation), then fades. A slow
+// network shows as a persistent underline — an honest lag meter; a failed POST strikes through red.
+type EchoEntry = { id: number; glyphs: string; state: 'sent' | 'acked' | 'failed' };
+const ECHO_GLYPHS: Record<string, string> = {
+  '\r': '⏎', '\n': '⏎', '\x7f': '⌫', '\t': '⇥', '\x1b': 'esc', ' ': '␣',
+  '\x1b[A': '▲', '\x1b[B': '▼', '\x1b[C': '▶', '\x1b[D': '◀',
+  '\x1b[H': '⇱', '\x1b[F': '⇲', '\x1b[5~': '⇞', '\x1b[6~': '⇟', '\x1b[3~': '⌦',
+};
+const echoGlyphsOf = (out: string): string | null => {
+  if (out.startsWith('\x1b[<')) return null;                    // mouse/wheel — motion, not typing
+  const mapped = ECHO_GLYPHS[out];
+  if (mapped) return mapped;
+  if (out.length === 1) {
+    const c = out.charCodeAt(0);
+    if (c < 32) return '^' + String.fromCharCode(c + 64);       // control chords: ^C ^B …
+    return out;
+  }
+  if (out.length === 2 && out.charCodeAt(0) === 27) return '⌥' + out[1];   // alt-prefixed char
+  if ([...out].every((ch) => ch.charCodeAt(0) >= 32)) {
+    return out.length > 12 ? out.slice(0, 11) + '…' : out;      // typed run / paste
+  }
+  return '·';                                                    // unknown sequence — show SOMETHING
 };
 
 // brief keep-alive after a session goes inactive — swiping back before this fires reuses the session
@@ -120,7 +152,7 @@ const fitFontSize = (availW: number, cols: number) =>
 
 export default function HeadTerminal({
   sessionTarget, apiBase = '/api/hq/term', kind = 'pane', active, interactive = true,
-  openDelayMs = 0, showControls = true, onClose, onError,
+  openDelayMs = 0, showControls = true, onClose, onError, predictiveEcho = 'auto',
 }: HeadTerminalProps) {
   const [sess, setSess] = useState<Sess | null>(null);
   // sticky modifiers — arm one (or several), the NEXT key composes with them then they auto-disarm.
@@ -221,13 +253,37 @@ export default function HeadTerminal({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  // predictive echo state — postBytes is the single choke point every input surface funnels
+  // through (native keyboard, desktop onData, accessory bar), so hooking here covers them all.
+  const [echo, setEcho] = useState<EchoEntry[]>([]);
+  const echoSeqRef = useRef(0);
+  const echoOn = interactive && kind === 'pane' && predictiveEcho !== 'off'
+    && (predictiveEcho === 'on'
+      || (typeof window !== 'undefined' && window.matchMedia('(pointer: coarse)').matches));
+  const echoSet = (id: number, state: EchoEntry['state']) =>
+    setEcho((p) => p.map((e) => (e.id === id ? { ...e, state } : e)));
+  const echoDrop = (id: number, afterMs: number) =>
+    setTimeout(() => setEcho((p) => p.filter((e) => e.id !== id)), afterMs);
+
   // ---- input: the low-level POST of raw bytes LIVE to the PTY. No modifier logic here.
   const postBytes = (out: string) => {
     const sid = sidRef.current;
     if (!sid || !out) return;
+    const glyphs = echoOn ? echoGlyphsOf(out) : null;
+    let id = 0;
+    if (glyphs) {
+      id = ++echoSeqRef.current;
+      setEcho((p) => [...p.slice(-31), { id, glyphs, state: 'sent' }]);   // bounded — never grows unread
+    }
     fetch(`${apiBase}/${encodeURIComponent(sid)}/input`, {
       method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ data: out }),
-    }).catch(() => {});
+    }).then((r) => {
+      if (!id) return;
+      if (r.ok) { echoSet(id, 'acked'); echoDrop(id, 450); }
+      else { echoSet(id, 'failed'); echoDrop(id, 1800); }
+    }).catch(() => {
+      if (id) { echoSet(id, 'failed'); echoDrop(id, 1800); }
+    });
   };
 
   // send a COMPLETE escape sequence (arrow, F-key, tmux chord, ⌃C…) — already fully formed. An armed
@@ -269,6 +325,7 @@ export default function HeadTerminal({
   useEffect(() => {
     if (!sess || !hostRef.current) return;
     lastRowsRef.current = null;          // new session → recompute the mirror row-count from scratch
+    setEcho([]);                         // stale pending-echo from a prior session must not carry over
     // A pane MIRROR is read-only: the head's real cursor is already baked into the captured bytes, so
     // xterm's OWN cursor block is a spurious artifact that lands at a stale position (Schyler: "cursor box
     // in the wrong place"). Hide it for mirrors (transparent = bg colour, no blink); keep a real cursor for
@@ -555,6 +612,23 @@ export default function HeadTerminal({
             color: stream === 'lost' ? C.red : C.amber, fontFamily: C.mono, fontSize: 10,
             background: 'rgba(4,7,10,.85)' }}>
             {stream === 'lost' ? '✗ stream lost — reopen the terminal' : '⚡ reconnecting…'}
+          </div>
+        )}
+        {/* predictive-echo strip — an OVERLAY, deliberately not written into the xterm grid (fake
+            bytes would corrupt the mirror and double with the real echo). pointerEvents:none. */}
+        {echoOn && echo.length > 0 && (
+          <div aria-hidden style={{ position: 'absolute', left: 8, bottom: 6, zIndex: 2, pointerEvents: 'none',
+            fontFamily: "'SFMono-Regular',ui-monospace,Consolas,monospace", fontSize: 13, lineHeight: 1.25,
+            background: 'rgba(4,7,10,.78)', padding: '1px 6px', borderRadius: 4,
+            maxWidth: 'calc(100% - 16px)', overflow: 'hidden', whiteSpace: 'nowrap' }}>
+            {echo.slice(-24).map((e) => (
+              <span key={e.id} style={{
+                color: e.state === 'failed' ? C.red : C.green,
+                opacity: e.state === 'acked' ? 0.5 : 0.95,
+                textDecoration: e.state === 'sent' ? 'underline' : e.state === 'failed' ? 'line-through' : 'none',
+                textUnderlineOffset: 2, transition: 'opacity .35s ease',
+              }}>{e.glyphs}</span>
+            ))}
           </div>
         )}
       </div>
