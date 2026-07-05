@@ -617,7 +617,7 @@ export default function HeadTerminal({
         {/* predictive-echo strip — an OVERLAY, deliberately not written into the xterm grid (fake
             bytes would corrupt the mirror and double with the real echo). pointerEvents:none. */}
         {echoOn && echo.length > 0 && (
-          <div aria-hidden style={{ position: 'absolute', left: 8, bottom: 6, zIndex: 2, pointerEvents: 'none',
+          <div aria-hidden className="hq-echo-strip" style={{ position: 'absolute', left: 8, bottom: 6, zIndex: 2, pointerEvents: 'none',
             fontFamily: "'SFMono-Regular',ui-monospace,Consolas,monospace", fontSize: 13, lineHeight: 1.25,
             background: 'rgba(4,7,10,.78)', padding: '1px 6px', borderRadius: 4,
             maxWidth: 'calc(100% - 16px)', overflow: 'hidden', whiteSpace: 'nowrap' }}>
