@@ -3,20 +3,30 @@
 // subtle glow, Linear/Vercel/Stripe-tier craft). E2 systematizes these across HQ; for now they
 // live with the console renderer.
 export const C = {
-  bg: '#070a07',
-  panel: '#0c110c',
-  panel2: '#0f150f',
-  raised: '#121a12',
-  line: 'rgba(0,255,65,.16)',
-  line2: 'rgba(0,255,65,.42)',       // brutalist: hard, visible edges (D refresh)
+  // ---- Refined Terminal (Direction A, 2026-07-06; research raw/06-design.md) ----
+  // The 4-step SURFACE LADDER: a cool near-black ramp (blue-biased neutral, not green-tinted)
+  // so phosphor-green stops being the color of everything and becomes the color of ALIVE.
+  bg: '#04070a',
+  panel: '#0a0e13',
+  panel2: '#10151b',
+  raised: '#151b22',
+  // hairline borders — neutral, no shadows; line2 = the emphasized edge
+  line: 'rgba(148,166,190,.12)',
+  line2: 'rgba(148,166,190,.30)',
+  // #22ff6a is now a RESERVED singleton (NASA color-usage rule): the selected head, the live
+  // cursor — never body chrome. Working/steady state uses the calmer work-green.
   green: '#22ff6a',
-  greenDim: 'rgba(120,230,160,.62)',
-  faint: 'rgba(120,200,150,.34)',
-  ink: '#d7f7e2',
-  muted: '#7fae90',
-  blue: '#5cc8ff',
-  amber: '#ffcf5c',
-  red: '#ff6b6b',
+  work: '#2bd96d',                   // the color of alive-and-working
+  wait: '#f5a623',                   // waiting on a human
+  err: '#ff5c5c',                    // failed / disconnected
+  greenDim: 'rgba(43,217,109,.62)',
+  faint: 'rgba(139,152,165,.38)',
+  // 4-step INK RAMP (cool neutrals; green ink was part of the flood)
+  ink: '#e6edf3',
+  muted: '#8b98a5',
+  blue: '#4da3ff',                   // links + info — calmer than the old cyan
+  amber: '#f5a623',
+  red: '#ff5c5c',
   violet: '#b79bff',
   // user bubble (blue-tinted)
   userBg: 'linear-gradient(180deg,rgba(92,200,255,.12),rgba(92,200,255,.06))',
