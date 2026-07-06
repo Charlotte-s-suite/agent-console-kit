@@ -1,7 +1,7 @@
 {
   "name": "@charlotte/agent-console-kit",
-  "version": "0.6.0",
-  "description": "Shared agent-console UI primitives \u2014 the reusable core of the Hydra HQ console, consumed by hydra-hq and merritt as a single source of truth.",
+  "version": "0.6.1",
+  "description": "Shared agent-console UI primitives — the reusable core of the Hydra HQ console, consumed by hydra-hq and merritt as a single source of truth.",
   "type": "module",
   "main": "src/index.ts",
   "peerDependencies": {
