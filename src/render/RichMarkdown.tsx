@@ -59,9 +59,30 @@ export function CodeBlock({ code, lang }: { code: string; lang?: string }) {
 }
 
 // ---- inline ------------------------------------------------------------------------------
+// Bare-URL autolink: agents paste raw `https://…` constantly (artifact links, PR URLs, deploy
+// handles) and an un-clickable URL on the phone means tedious manual copy. A bare URL becomes a
+// live link — or an inline image when its path says it IS one (same exposure class as the
+// `![](…)` images we already auto-render; both gate through safeUrl). Trailing prose
+// punctuation ("see https://x.com." / "(https://x.com)") is peeled back onto the text so the
+// href stays clean; a ')' stays in the URL only while it has an unclosed '(' (wiki paths).
+const IMG_EXT_RE = /\.(png|jpe?g|gif|webp|svg|avif)(\?[^#\s]*)?(#\S*)?$/i;
+
+function splitTrailingPunct(raw: string): [string, string] {
+  let url = raw, trail = '';
+  for (;;) {
+    if (/[.,;:!?'"’”]$/.test(url)) { trail = url.slice(-1) + trail; url = url.slice(0, -1); continue; }
+    if (url.endsWith(')')) {
+      const opens = (url.match(/\(/g) ?? []).length;
+      const closes = (url.match(/\)/g) ?? []).length;
+      if (closes > opens) { trail = ')' + trail; url = url.slice(0, -1); continue; }
+    }
+    return [url, trail];
+  }
+}
+
 function inline(text: string, key: string): ReactNode[] {
   const out: ReactNode[] = [];
-  const re = /(!\[[^\]]*\]\([^)]+\))|(\[[^\]]+\]\([^)]+\))|(`[^`]+`)|(\*\*[^*]+\*\*)|(\*[^*]+\*)|(_[^_]+_)/g;
+  const re = /(!\[[^\]]*\]\([^)]+\))|(\[[^\]]+\]\([^)]+\))|(`[^`]+`)|(\*\*[^*]+\*\*)|(https?:\/\/[^\s<>]+)|(\*[^*]+\*)|(_[^_]+_)/g;
   let last = 0, m: RegExpExecArray | null, i = 0;
   while ((m = re.exec(text)) !== null) {
     if (m.index > last) out.push(<Fragment key={`${key}-t${i}`}>{text.slice(last, m.index)}</Fragment>);
@@ -82,6 +103,22 @@ function inline(text: string, key: string): ReactNode[] {
       out.push(<code key={`${key}-c${i}`} style={{ fontFamily: C.mono, fontSize: 12, background: 'rgba(34,255,106,.1)', padding: '1px 5px', borderRadius: C.radius, color: C.green }}>{tok.slice(1, -1)}</code>);
     } else if (tok.startsWith('**')) {
       out.push(<strong key={`${key}-b${i}`} style={{ color: C.green, fontWeight: 700 }}>{tok.slice(2, -2)}</strong>);
+    } else if (tok.startsWith('http')) {
+      const [url, trail] = splitTrailingPunct(tok);
+      const href = safeUrl(url);
+      if (!href) {
+        out.push(<Fragment key={`${key}-u${i}`}>{tok}</Fragment>);
+      } else if (IMG_EXT_RE.test(url)) {
+        // an image URL renders as the image, wrapped in a link (click-through = the full-size original)
+        out.push(
+          <a key={`${key}-u${i}`} href={href} target="_blank" rel="noreferrer">
+            <img src={href} alt={url} style={{ maxWidth: '100%', borderRadius: C.radius, border: `1px solid ${C.line}`, margin: '4px 0', display: 'block' }} />
+          </a>,
+        );
+      } else {
+        out.push(<a key={`${key}-u${i}`} href={href} target="_blank" rel="noreferrer" style={{ color: C.blue, textDecoration: 'none', wordBreak: 'break-all' }}>{url}</a>);
+      }
+      if (trail) out.push(<Fragment key={`${key}-uT${i}`}>{trail}</Fragment>);
     } else {
       out.push(<em key={`${key}-i${i}`}>{tok.slice(1, -1)}</em>);
     }
