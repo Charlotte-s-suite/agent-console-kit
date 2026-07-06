@@ -249,7 +249,7 @@ export default function Composer({ sessionTarget, apiBase = '/api/hq', commandsF
             style={{ width: 30, height: 30, borderRadius: C.radius, border: `1px solid ${C.line}`, background: C.raised, color: uploading ? C.green : C.greenDim, cursor: uploading ? 'wait' : 'pointer', fontSize: 14, flex: '0 0 auto', display: 'inline-flex', alignItems: 'center', justifyContent: 'center', position: 'relative', overflow: 'hidden' }}>
             {uploading ? '…' : '📎'}
             {/* visually hidden (NOT display:none) so iOS Safari lets the label trigger it natively */}
-            <input ref={fileRef} type="file" multiple accept="image/*,.pdf,.txt,.md,.csv,.json,.log,.py,.ts,.tsx,.js,.pem,.key,.crt"
+            <input ref={fileRef} type="file" multiple accept="image/*,.pdf,.txt,.md,.csv,.json,.log,.py,.ts,.tsx,.js,.pem,.key,.crt,.zip,.tar,.gz,.tgz,.7z"
               onChange={(e) => attach(e.target.files)} disabled={uploading}
               style={{ position: 'absolute', inset: 0, opacity: 0, cursor: 'pointer', fontSize: 16 }} />
           </label>
