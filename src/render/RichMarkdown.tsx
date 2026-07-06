@@ -80,7 +80,36 @@ function splitTrailingPunct(raw: string): [string, string] {
   }
 }
 
-function inline(text: string, key: string): ReactNode[] {
+// Per-link actions (E2): every http(s) link — markdown or bare — carries two tiny inline
+// buttons: ⧉ copy (flashes ✓) and ◫ preview. Preview calls the consumer's onPreview (hq docks
+// an in-chat iframe browser); without a handler it degrades to open-in-new-tab, so the buttons
+// are never dead weight in a consumer that hasn't wired a dock. mailto:/tel:/relative hrefs
+// get no chrome — copying a mailto: is noise and an iframe preview of one is meaningless.
+function LinkActions({ href, onPreview }: { href: string; onPreview?: (url: string) => void }) {
+  const [copied, setCopied] = useState(false);
+  const btn: React.CSSProperties = {
+    background: 'transparent', border: `1px solid ${C.line}`, borderRadius: C.radius, cursor: 'pointer',
+    fontFamily: C.mono, fontSize: 9, lineHeight: '13px', padding: '0 4px', verticalAlign: 'baseline',
+  };
+  return (
+    <span style={{ display: 'inline-flex', gap: 3, marginLeft: 4, verticalAlign: 'baseline' }}>
+      <button
+        type="button" title="copy URL"
+        onClick={(e) => { e.preventDefault(); e.stopPropagation(); navigator.clipboard?.writeText(href).then(() => { setCopied(true); setTimeout(() => setCopied(false), 1200); }).catch(() => {}); }}
+        style={{ ...btn, color: copied ? C.green : C.muted }}
+      >{copied ? '✓' : '⧉'}</button>
+      <button
+        type="button" title="preview in dock"
+        onClick={(e) => { e.preventDefault(); e.stopPropagation(); if (onPreview) onPreview(href); else window.open(href, '_blank', 'noopener'); }}
+        style={{ ...btn, color: C.muted }}
+      >◫</button>
+    </span>
+  );
+}
+
+const linkable = (href: string) => /^https?:\/\//i.test(href);
+
+function inline(text: string, key: string, onPreview?: (url: string) => void): ReactNode[] {
   const out: ReactNode[] = [];
   const re = /(!\[[^\]]*\]\([^)]+\))|(\[[^\]]+\]\([^)]+\))|(`[^`]+`)|(\*\*[^*]+\*\*)|(https?:\/\/[^\s<>]+)|(\*[^*]+\*)|(_[^_]+_)/g;
   let last = 0, m: RegExpExecArray | null, i = 0;
@@ -97,8 +126,10 @@ function inline(text: string, key: string): ReactNode[] {
       const mm = /\[([^\]]+)\]\(([^)]+)\)/.exec(tok)!;
       const href = safeUrl(mm[2]);
       // Unsafe href → render the label as inert text instead of a live (javascript:) link.
-      if (href) out.push(<a key={`${key}-a${i}`} href={href} target="_blank" rel="noreferrer" style={{ color: C.blue, textDecoration: 'none' }}>{mm[1]}</a>);
-      else out.push(<Fragment key={`${key}-a${i}`}>{mm[1]}</Fragment>);
+      if (href) {
+        out.push(<a key={`${key}-a${i}`} href={href} target="_blank" rel="noreferrer" style={{ color: C.blue, textDecoration: 'none' }}>{mm[1]}</a>);
+        if (linkable(href)) out.push(<LinkActions key={`${key}-aA${i}`} href={href} onPreview={onPreview} />);
+      } else out.push(<Fragment key={`${key}-a${i}`}>{mm[1]}</Fragment>);
     } else if (tok.startsWith('`')) {
       out.push(<code key={`${key}-c${i}`} style={{ fontFamily: C.mono, fontSize: 12, background: 'rgba(34,255,106,.1)', padding: '1px 5px', borderRadius: C.radius, color: C.green }}>{tok.slice(1, -1)}</code>);
     } else if (tok.startsWith('**')) {
@@ -117,6 +148,7 @@ function inline(text: string, key: string): ReactNode[] {
         );
       } else {
         out.push(<a key={`${key}-u${i}`} href={href} target="_blank" rel="noreferrer" style={{ color: C.blue, textDecoration: 'none', wordBreak: 'break-all' }}>{url}</a>);
+        out.push(<LinkActions key={`${key}-uA${i}`} href={href} onPreview={onPreview} />);
       }
       if (trail) out.push(<Fragment key={`${key}-uT${i}`}>{trail}</Fragment>);
     } else {
@@ -163,7 +195,7 @@ function alignOf(cell: string): Align {
   return l && r ? 'center' : r ? 'right' : 'left';
 }
 
-function TableBlock({ head, aligns, rows }: { head: string[]; aligns: Align[]; rows: string[][] }) {
+function TableBlock({ head, aligns, rows, onPreview }: { head: string[]; aligns: Align[]; rows: string[][]; onPreview?: (url: string) => void }) {
   return (
     <div style={{ margin: '8px 0 2px', overflowX: 'auto', border: `1px solid ${C.line}`, borderRadius: C.radius }}>
       <table style={{ borderCollapse: 'collapse', width: '100%', fontFamily: C.sans, fontSize: 13 }}>
@@ -171,7 +203,7 @@ function TableBlock({ head, aligns, rows }: { head: string[]; aligns: Align[]; r
           <tr>
             {head.map((h, n) => (
               <th key={n} style={{ textAlign: aligns[n] || 'left', padding: '6px 10px', borderBottom: `1px solid ${C.line2}`, background: 'rgba(34,255,106,.05)', color: C.green, fontWeight: 700, whiteSpace: 'nowrap' }}>
-                {inline(h, `th${n}`)}
+                {inline(h, `th${n}`, onPreview)}
               </th>
             ))}
           </tr>
@@ -181,7 +213,7 @@ function TableBlock({ head, aligns, rows }: { head: string[]; aligns: Align[]; r
             <tr key={ri}>
               {head.map((_, ci) => (
                 <td key={ci} style={{ textAlign: aligns[ci] || 'left', padding: '5px 10px', borderTop: `1px solid ${C.line}`, color: C.ink, verticalAlign: 'top' }}>
-                  {inline(r[ci] ?? '', `td${ri}-${ci}`)}
+                  {inline(r[ci] ?? '', `td${ri}-${ci}`, onPreview)}
                 </td>
               ))}
             </tr>
@@ -195,8 +227,8 @@ function TableBlock({ head, aligns, rows }: { head: string[]; aligns: Align[]; r
 const HSIZE = [19, 17, 15, 14, 13, 12];
 
 export default function RichMarkdown(
-  { source, dim = false, font, ink, size }:
-    { source: string; dim?: boolean; font?: string; ink?: string; size?: number },
+  { source, dim = false, font, ink, size, onPreview }:
+    { source: string; dim?: boolean; font?: string; ink?: string; size?: number; onPreview?: (url: string) => void },
 ) {
   const lines = source.replace(/\r\n/g, '\n').split('\n');
   const blocks: ReactNode[] = [];
@@ -228,12 +260,12 @@ export default function RichMarkdown(
       i += 2;
       const rows: string[][] = [];
       while (i < lines.length && lines[i].includes('|') && !/^\s*$/.test(lines[i])) rows.push(splitRow(lines[i++]));
-      blocks.push(<TableBlock key={key++} head={head} aligns={aligns} rows={rows} />);
+      blocks.push(<TableBlock key={key++} head={head} aligns={aligns} rows={rows} onPreview={onPreview} />);
       continue;
     }
     const h = /^(#{1,6})\s+(.*)$/.exec(line);
     if (h) {
-      blocks.push(<div key={key++} style={{ fontSize: HSIZE[h[1].length - 1], fontWeight: 700, color: C.green, margin: '12px 0 6px' }}>{inline(h[2], `h${key}`)}</div>);
+      blocks.push(<div key={key++} style={{ fontSize: HSIZE[h[1].length - 1], fontWeight: 700, color: C.green, margin: '12px 0 6px' }}>{inline(h[2], `h${key}`, onPreview)}</div>);
       i++; continue;
     }
     if (/^\s*(---|\*\*\*|___)\s*$/.test(line)) {
@@ -243,7 +275,7 @@ export default function RichMarkdown(
     if (/^\s*>\s?/.test(line)) {
       const buf: string[] = [];
       while (i < lines.length && /^\s*>\s?/.test(lines[i])) buf.push(lines[i++].replace(/^\s*>\s?/, ''));
-      blocks.push(<blockquote key={key++} style={{ borderLeft: `3px solid ${C.line2}`, margin: '8px 0', padding: '2px 0 2px 10px', color: C.muted }}>{inline(buf.join(' '), `q${key}`)}</blockquote>);
+      blocks.push(<blockquote key={key++} style={{ borderLeft: `3px solid ${C.line2}`, margin: '8px 0', padding: '2px 0 2px 10px', color: C.muted }}>{inline(buf.join(' '), `q${key}`, onPreview)}</blockquote>);
       continue;
     }
     if (/^\s*([-*+]|\d+\.)\s+/.test(line)) {
@@ -253,8 +285,8 @@ export default function RichMarkdown(
       const ls: React.CSSProperties = { margin: '6px 0', paddingLeft: 20, color: prose };
       const li: React.CSSProperties = { margin: '3px 0', lineHeight: 1.5 };
       blocks.push(ordered
-        ? <ol key={key++} style={ls}>{items.map((it, n) => <li key={n} style={li}>{inline(it, `li${key}-${n}`)}</li>)}</ol>
-        : <ul key={key++} style={ls}>{items.map((it, n) => <li key={n} style={li}>{inline(it, `li${key}-${n}`)}</li>)}</ul>);
+        ? <ol key={key++} style={ls}>{items.map((it, n) => <li key={n} style={li}>{inline(it, `li${key}-${n}`, onPreview)}</li>)}</ol>
+        : <ul key={key++} style={ls}>{items.map((it, n) => <li key={n} style={li}>{inline(it, `li${key}-${n}`, onPreview)}</li>)}</ul>);
       continue;
     }
     if (/^\s*$/.test(line)) { i++; continue; }
@@ -265,7 +297,7 @@ export default function RichMarkdown(
       && !(lines[i].includes('|') && i + 1 < lines.length && isTableDelim(lines[i + 1]))) {
       para.push(lines[i++]);
     }
-    blocks.push(<p key={key++} style={{ margin: '0 0 8px', lineHeight: 1.6, color: prose, fontStyle: dim ? 'italic' : 'normal' }}>{inline(para.join(' '), `p${key}`)}</p>);
+    blocks.push(<p key={key++} style={{ margin: '0 0 8px', lineHeight: 1.6, color: prose, fontStyle: dim ? 'italic' : 'normal' }}>{inline(para.join(' '), `p${key}`, onPreview)}</p>);
   }
 
   return <div style={{ fontFamily: font || C.sans, fontSize: size || 14 }}>{blocks}</div>;
