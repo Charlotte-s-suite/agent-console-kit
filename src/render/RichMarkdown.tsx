@@ -157,7 +157,7 @@ export function PathToken({ path, mono, onOpenPath }: { path: string; mono?: boo
 
 function inline(text: string, key: string, onPreview?: (url: string) => void, onOpenPath?: (path: string) => void): ReactNode[] {
   const out: ReactNode[] = [];
-  const re = /(!\[[^\]]*\]\([^)]+\))|(\[[^\]]+\]\([^)]+\))|(`[^`]+`)|(\*\*[^*]+\*\*)|(https?:\/\/[^\s<>]+)|((?<=^|[\s([{'"])(?:~|\/home\/[A-Za-z0-9_][A-Za-z0-9_.-]*)(?:\/[^\s<>|'"`)\]},;]+)+\/?(?::\d+(?::\d+)?)?)|(\*[^*]+\*)|(_[^_]+_)/g;
+  const re = /(!\[[^\]]*\]\([^)]+\))|(\[[^\]]+\]\([^)]+\))|(`[^`]+`)|(\*\*[^*]+\*\*)|(https?:\/\/[^\s<>]+)|((?<=^|[\s([{'"])(?:~|\/home\/[A-Za-z0-9_][A-Za-z0-9_.-]*)(?:\/[^\s\/<>|'"`)\]},;]+)+\/?(?::\d+(?::\d+)?)?)|(\*[^*]+\*)|(_[^_]+_)/g;
   let last = 0, m: RegExpExecArray | null, i = 0;
   while ((m = re.exec(text)) !== null) {
     if (m.index > last) out.push(<Fragment key={`${key}-t${i}`}>{text.slice(last, m.index)}</Fragment>);

@@ -90,6 +90,15 @@ describe('path tokens — pathological input (the ReDoS class)', () => {
     expect(Date.now() - t0).toBeLessThan(250);
   });
 
+  it('tokenizer sweep stays linear on a bare near-miss in prose (the inlined regex copy)', () => {
+    // The tokenizer inlines the path pattern in its big alternation — it MUST carry the same
+    // /-excluded segment class as PATH_SRC, or the two copies drift and the bug re-enters.
+    const evil = '/home/user' + '/a'.repeat(5000) + '<';
+    const t0 = Date.now();
+    md(`crash at ${evil} now`);
+    expect(Date.now() - t0).toBeLessThan(250);
+  });
+
   it('tokenizer sweep stays linear on a near-miss inside backticks', () => {
     const evil = '`' + '/home/user' + '/a'.repeat(5000) + '<' + '`';
     const t0 = Date.now();
