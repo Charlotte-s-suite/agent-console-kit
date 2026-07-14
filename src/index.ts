@@ -7,7 +7,7 @@ export { default as HeadTerminal, type HeadTerminalProps } from './HeadTerminal'
 export { default as Composer } from './Composer';
 export { type SlashCommand, type CommandsResponse } from './types';
 export { default as TuiKeyboard } from './TuiKeyboard';
-export { default as RichMarkdown, CodeBlock, DiffBlock, looksLikeDiff } from './render/RichMarkdown';
+export { default as RichMarkdown, CodeBlock, DiffBlock, looksLikeDiff, InlineText, PathToken, isPathToken } from './render/RichMarkdown';
 export { default as PreviewDock } from './render/PreviewDock';
 export { tokenize, type TokClass } from './render/highlight';
 export { safeUrl } from './render/sanitizeUrl';

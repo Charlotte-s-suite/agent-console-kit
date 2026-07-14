@@ -109,9 +109,55 @@ function LinkActions({ href, onPreview }: { href: string; onPreview?: (url: stri
 
 const linkable = (href: string) => /^https?:\/\//i.test(href);
 
-function inline(text: string, key: string, onPreview?: (url: string) => void): ReactNode[] {
+// ---- file-path tokens (E3) ------------------------------------------------------------------
+// Heads talk in paths — tool output, worktrees, `file.py:42` refs — and on the phone a path you
+// can't tap is a dead end. A home-rooted path becomes a live token: click opens it in the
+// consumer's file explorer via onOpenPath (hq wires its FilesPanel); without a handler it
+// click-copies, so the token is never dead weight in a consumer with no explorer. Paths render
+// as an onClick <button>, never an href — no URL scheme ever reaches the DOM from this branch.
+// Only `~/…` and `/home/<user>/…` match, deliberately: the hq files-relay is confined under ~,
+// and requiring the home root keeps prose ("and/or", "24/7") and API routes ("/api/hq/files")
+// from lighting up as paths. A trailing `:12` / `:12:5` line ref stays in the display + copy
+// text but is stripped from the open target.
+// The segment class EXCLUDES `/` — each `(?:\/…+)` is exactly one path component. With `/`
+// admitted the group is an ambiguous (a+)+ → exponential backtracking on anchored .test():
+// ~30 backticked segments + one excluded char froze the console for seconds (warden BLOCKER,
+// hydra-hq#278 review; pinned by the pathological-input test).
+const PATH_SRC = String.raw`(?:~|\/home\/[A-Za-z0-9_][A-Za-z0-9_.-]*)(?:\/[^\s\/<>|'"\`)\]},;]+)+\/?`;
+const PATH_FULL_RE = new RegExp(`^${PATH_SRC}(?::\\d+(?::\\d+)?)?$`);
+const stripLineRef = (p: string) => p.replace(/:\d+(?::\d+)?$/, '');
+// Exact-match probe for consumers with their own tokenizers (e.g. hq's MarkdownView code spans).
+export const isPathToken = (s: string) => PATH_FULL_RE.test(s);
+
+export function PathToken({ path, mono, onOpenPath }: { path: string; mono?: boolean; onOpenPath?: (path: string) => void }) {
+  const [copied, setCopied] = useState(false);
+  const copy = () => {
+    navigator.clipboard?.writeText(path).then(() => { setCopied(true); setTimeout(() => setCopied(false), 1200); }).catch(() => {});
+  };
+  return (
+    <>
+      <button
+        type="button" title={onOpenPath ? 'open in file explorer' : 'copy path'}
+        onClick={() => (onOpenPath ? onOpenPath(stripLineRef(path)) : copy())}
+        style={{
+          background: mono ? 'rgba(34,255,106,.1)' : 'transparent', border: 'none',
+          padding: mono ? '1px 5px' : 0, borderRadius: mono ? C.radius : 0,
+          color: C.blue, cursor: 'pointer', fontFamily: C.mono, fontSize: 12,
+          textDecoration: 'underline', textDecorationStyle: 'dotted', textUnderlineOffset: 3, wordBreak: 'break-all',
+        }}
+      >{path}</button>
+      <button
+        type="button" title="copy path"
+        onClick={(e) => { e.preventDefault(); e.stopPropagation(); copy(); }}
+        style={{ background: 'transparent', border: `1px solid ${C.line}`, borderRadius: C.radius, cursor: 'pointer', fontFamily: C.mono, fontSize: 9, lineHeight: '13px', padding: '0 4px', marginLeft: 4, verticalAlign: 'baseline', color: copied ? C.green : C.muted }}
+      >{copied ? '✓' : '⧉'}</button>
+    </>
+  );
+}
+
+function inline(text: string, key: string, onPreview?: (url: string) => void, onOpenPath?: (path: string) => void): ReactNode[] {
   const out: ReactNode[] = [];
-  const re = /(!\[[^\]]*\]\([^)]+\))|(\[[^\]]+\]\([^)]+\))|(`[^`]+`)|(\*\*[^*]+\*\*)|(https?:\/\/[^\s<>]+)|(\*[^*]+\*)|(_[^_]+_)/g;
+  const re = /(!\[[^\]]*\]\([^)]+\))|(\[[^\]]+\]\([^)]+\))|(`[^`]+`)|(\*\*[^*]+\*\*)|(https?:\/\/[^\s<>]+)|((?<=^|[\s([{'"])(?:~|\/home\/[A-Za-z0-9_][A-Za-z0-9_.-]*)(?:\/[^\s\/<>|'"`)\]},;]+)+\/?(?::\d+(?::\d+)?)?)|(\*[^*]+\*)|(_[^_]+_)/g;
   let last = 0, m: RegExpExecArray | null, i = 0;
   while ((m = re.exec(text)) !== null) {
     if (m.index > last) out.push(<Fragment key={`${key}-t${i}`}>{text.slice(last, m.index)}</Fragment>);
@@ -131,7 +177,11 @@ function inline(text: string, key: string, onPreview?: (url: string) => void): R
         if (linkable(href)) out.push(<LinkActions key={`${key}-aA${i}`} href={href} onPreview={onPreview} />);
       } else out.push(<Fragment key={`${key}-a${i}`}>{mm[1]}</Fragment>);
     } else if (tok.startsWith('`')) {
-      out.push(<code key={`${key}-c${i}`} style={{ fontFamily: C.mono, fontSize: 12, background: 'rgba(34,255,106,.1)', padding: '1px 5px', borderRadius: C.radius, color: C.green }}>{tok.slice(1, -1)}</code>);
+      const body = tok.slice(1, -1);
+      // A backticked path (`~/x/y.md`, `file.py:42` style) is how paths most often arrive in
+      // transcripts — keep the code-chip look but make it live like a bare path token.
+      if (PATH_FULL_RE.test(body)) out.push(<PathToken key={`${key}-c${i}`} path={body} mono onOpenPath={onOpenPath} />);
+      else out.push(<code key={`${key}-c${i}`} style={{ fontFamily: C.mono, fontSize: 12, background: 'rgba(34,255,106,.1)', padding: '1px 5px', borderRadius: C.radius, color: C.green }}>{body}</code>);
     } else if (tok.startsWith('**')) {
       out.push(<strong key={`${key}-b${i}`} style={{ color: C.green, fontWeight: 700 }}>{tok.slice(2, -2)}</strong>);
     } else if (tok.startsWith('http')) {
@@ -151,6 +201,10 @@ function inline(text: string, key: string, onPreview?: (url: string) => void): R
         out.push(<LinkActions key={`${key}-uA${i}`} href={href} onPreview={onPreview} />);
       }
       if (trail) out.push(<Fragment key={`${key}-uT${i}`}>{trail}</Fragment>);
+    } else if (tok.startsWith('~') || tok.startsWith('/')) {
+      const [path, trail] = splitTrailingPunct(tok);
+      out.push(<PathToken key={`${key}-p${i}`} path={path} onOpenPath={onOpenPath} />);
+      if (trail) out.push(<Fragment key={`${key}-pT${i}`}>{trail}</Fragment>);
     } else {
       out.push(<em key={`${key}-i${i}`}>{tok.slice(1, -1)}</em>);
     }
@@ -195,7 +249,7 @@ function alignOf(cell: string): Align {
   return l && r ? 'center' : r ? 'right' : 'left';
 }
 
-function TableBlock({ head, aligns, rows, onPreview }: { head: string[]; aligns: Align[]; rows: string[][]; onPreview?: (url: string) => void }) {
+function TableBlock({ head, aligns, rows, onPreview, onOpenPath }: { head: string[]; aligns: Align[]; rows: string[][]; onPreview?: (url: string) => void; onOpenPath?: (path: string) => void }) {
   return (
     <div style={{ margin: '8px 0 2px', overflowX: 'auto', border: `1px solid ${C.line}`, borderRadius: C.radius }}>
       <table style={{ borderCollapse: 'collapse', width: '100%', fontFamily: C.sans, fontSize: 13 }}>
@@ -203,7 +257,7 @@ function TableBlock({ head, aligns, rows, onPreview }: { head: string[]; aligns:
           <tr>
             {head.map((h, n) => (
               <th key={n} style={{ textAlign: aligns[n] || 'left', padding: '6px 10px', borderBottom: `1px solid ${C.line2}`, background: 'rgba(34,255,106,.05)', color: C.green, fontWeight: 700, whiteSpace: 'nowrap' }}>
-                {inline(h, `th${n}`, onPreview)}
+                {inline(h, `th${n}`, onPreview, onOpenPath)}
               </th>
             ))}
           </tr>
@@ -213,7 +267,7 @@ function TableBlock({ head, aligns, rows, onPreview }: { head: string[]; aligns:
             <tr key={ri}>
               {head.map((_, ci) => (
                 <td key={ci} style={{ textAlign: aligns[ci] || 'left', padding: '5px 10px', borderTop: `1px solid ${C.line}`, color: C.ink, verticalAlign: 'top' }}>
-                  {inline(r[ci] ?? '', `td${ri}-${ci}`, onPreview)}
+                  {inline(r[ci] ?? '', `td${ri}-${ci}`, onPreview, onOpenPath)}
                 </td>
               ))}
             </tr>
@@ -227,8 +281,8 @@ function TableBlock({ head, aligns, rows, onPreview }: { head: string[]; aligns:
 const HSIZE = [19, 17, 15, 14, 13, 12];
 
 export default function RichMarkdown(
-  { source, dim = false, font, ink, size, onPreview }:
-    { source: string; dim?: boolean; font?: string; ink?: string; size?: number; onPreview?: (url: string) => void },
+  { source, dim = false, font, ink, size, onPreview, onOpenPath }:
+    { source: string; dim?: boolean; font?: string; ink?: string; size?: number; onPreview?: (url: string) => void; onOpenPath?: (path: string) => void },
 ) {
   const lines = source.replace(/\r\n/g, '\n').split('\n');
   const blocks: ReactNode[] = [];
@@ -260,12 +314,12 @@ export default function RichMarkdown(
       i += 2;
       const rows: string[][] = [];
       while (i < lines.length && lines[i].includes('|') && !/^\s*$/.test(lines[i])) rows.push(splitRow(lines[i++]));
-      blocks.push(<TableBlock key={key++} head={head} aligns={aligns} rows={rows} onPreview={onPreview} />);
+      blocks.push(<TableBlock key={key++} head={head} aligns={aligns} rows={rows} onPreview={onPreview} onOpenPath={onOpenPath} />);
       continue;
     }
     const h = /^(#{1,6})\s+(.*)$/.exec(line);
     if (h) {
-      blocks.push(<div key={key++} style={{ fontSize: HSIZE[h[1].length - 1], fontWeight: 700, color: C.green, margin: '12px 0 6px' }}>{inline(h[2], `h${key}`, onPreview)}</div>);
+      blocks.push(<div key={key++} style={{ fontSize: HSIZE[h[1].length - 1], fontWeight: 700, color: C.green, margin: '12px 0 6px' }}>{inline(h[2], `h${key}`, onPreview, onOpenPath)}</div>);
       i++; continue;
     }
     if (/^\s*(---|\*\*\*|___)\s*$/.test(line)) {
@@ -275,7 +329,7 @@ export default function RichMarkdown(
     if (/^\s*>\s?/.test(line)) {
       const buf: string[] = [];
       while (i < lines.length && /^\s*>\s?/.test(lines[i])) buf.push(lines[i++].replace(/^\s*>\s?/, ''));
-      blocks.push(<blockquote key={key++} style={{ borderLeft: `3px solid ${C.line2}`, margin: '8px 0', padding: '2px 0 2px 10px', color: C.muted }}>{inline(buf.join(' '), `q${key}`, onPreview)}</blockquote>);
+      blocks.push(<blockquote key={key++} style={{ borderLeft: `3px solid ${C.line2}`, margin: '8px 0', padding: '2px 0 2px 10px', color: C.muted }}>{inline(buf.join(' '), `q${key}`, onPreview, onOpenPath)}</blockquote>);
       continue;
     }
     if (/^\s*([-*+]|\d+\.)\s+/.test(line)) {
@@ -285,8 +339,8 @@ export default function RichMarkdown(
       const ls: React.CSSProperties = { margin: '6px 0', paddingLeft: 20, color: prose };
       const li: React.CSSProperties = { margin: '3px 0', lineHeight: 1.5 };
       blocks.push(ordered
-        ? <ol key={key++} style={ls}>{items.map((it, n) => <li key={n} style={li}>{inline(it, `li${key}-${n}`, onPreview)}</li>)}</ol>
-        : <ul key={key++} style={ls}>{items.map((it, n) => <li key={n} style={li}>{inline(it, `li${key}-${n}`, onPreview)}</li>)}</ul>);
+        ? <ol key={key++} style={ls}>{items.map((it, n) => <li key={n} style={li}>{inline(it, `li${key}-${n}`, onPreview, onOpenPath)}</li>)}</ol>
+        : <ul key={key++} style={ls}>{items.map((it, n) => <li key={n} style={li}>{inline(it, `li${key}-${n}`, onPreview, onOpenPath)}</li>)}</ul>);
       continue;
     }
     if (/^\s*$/.test(line)) { i++; continue; }
@@ -297,8 +351,39 @@ export default function RichMarkdown(
       && !(lines[i].includes('|') && i + 1 < lines.length && isTableDelim(lines[i + 1]))) {
       para.push(lines[i++]);
     }
-    blocks.push(<p key={key++} style={{ margin: '0 0 8px', lineHeight: 1.6, color: prose, fontStyle: dim ? 'italic' : 'normal' }}>{inline(para.join(' '), `p${key}`, onPreview)}</p>);
+    blocks.push(<p key={key++} style={{ margin: '0 0 8px', lineHeight: 1.6, color: prose, fontStyle: dim ? 'italic' : 'normal' }}>{inline(para.join(' '), `p${key}`, onPreview, onOpenPath)}</p>);
   }
 
   return <div style={{ fontFamily: font || C.sans, fontSize: size || 14 }}>{blocks}</div>;
+}
+
+// ---- InlineText ----------------------------------------------------------------------------
+// The URL + path branches of inline() WITHOUT the markdown ones — for surfaces that render
+// user-typed text verbatim (user chat bubbles): `_snake_case_` and `*globs*` must not restyle,
+// but a pasted URL or home-rooted path should still be live. Pair with `whiteSpace: pre-wrap`
+// on the container; newlines pass through untouched.
+export function InlineText(
+  { text, onPreview, onOpenPath }:
+    { text: string; onPreview?: (url: string) => void; onOpenPath?: (path: string) => void },
+) {
+  const re = new RegExp(String.raw`(https?:\/\/[^\s<>]+)|((?<=^|[\s([{'"])${PATH_SRC}(?::\d+(?::\d+)?)?)`, 'g');
+  const out: ReactNode[] = [];
+  let last = 0, m: RegExpExecArray | null, i = 0;
+  while ((m = re.exec(text)) !== null) {
+    if (m.index > last) out.push(<Fragment key={`t${i}`}>{text.slice(last, m.index)}</Fragment>);
+    const [tok, trail] = splitTrailingPunct(m[0]);
+    if (tok.startsWith('http')) {
+      const href = safeUrl(tok);
+      if (href) {
+        out.push(<a key={`u${i}`} href={href} target="_blank" rel="noreferrer" style={{ color: C.blue, textDecoration: 'none', wordBreak: 'break-all' }}>{tok}</a>);
+        out.push(<LinkActions key={`uA${i}`} href={href} onPreview={onPreview} />);
+      } else out.push(<Fragment key={`u${i}`}>{tok}</Fragment>);
+    } else {
+      out.push(<PathToken key={`p${i}`} path={tok} onOpenPath={onOpenPath} />);
+    }
+    if (trail) out.push(<Fragment key={`tT${i}`}>{trail}</Fragment>);
+    last = m.index + m[0].length; i += 1;
+  }
+  if (last < text.length) out.push(<Fragment key="tE">{text.slice(last)}</Fragment>);
+  return <>{out}</>;
 }
