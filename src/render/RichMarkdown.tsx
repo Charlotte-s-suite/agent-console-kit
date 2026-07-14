@@ -122,8 +122,10 @@ const linkable = (href: string) => /^https?:\/\//i.test(href);
 const PATH_SRC = String.raw`(?:~|\/home\/[A-Za-z0-9_][A-Za-z0-9_.-]*)(?:\/[^\s<>|'"\`)\]},;]+)+\/?`;
 const PATH_FULL_RE = new RegExp(`^${PATH_SRC}(?::\\d+(?::\\d+)?)?$`);
 const stripLineRef = (p: string) => p.replace(/:\d+(?::\d+)?$/, '');
+// Exact-match probe for consumers with their own tokenizers (e.g. hq's MarkdownView code spans).
+export const isPathToken = (s: string) => PATH_FULL_RE.test(s);
 
-function PathToken({ path, mono, onOpenPath }: { path: string; mono?: boolean; onOpenPath?: (path: string) => void }) {
+export function PathToken({ path, mono, onOpenPath }: { path: string; mono?: boolean; onOpenPath?: (path: string) => void }) {
   const [copied, setCopied] = useState(false);
   const copy = () => {
     navigator.clipboard?.writeText(path).then(() => { setCopied(true); setTimeout(() => setCopied(false), 1200); }).catch(() => {});
