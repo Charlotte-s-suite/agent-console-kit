@@ -119,7 +119,11 @@ const linkable = (href: string) => /^https?:\/\//i.test(href);
 // and requiring the home root keeps prose ("and/or", "24/7") and API routes ("/api/hq/files")
 // from lighting up as paths. A trailing `:12` / `:12:5` line ref stays in the display + copy
 // text but is stripped from the open target.
-const PATH_SRC = String.raw`(?:~|\/home\/[A-Za-z0-9_][A-Za-z0-9_.-]*)(?:\/[^\s<>|'"\`)\]},;]+)+\/?`;
+// The segment class EXCLUDES `/` — each `(?:\/…+)` is exactly one path component. With `/`
+// admitted the group is an ambiguous (a+)+ → exponential backtracking on anchored .test():
+// ~30 backticked segments + one excluded char froze the console for seconds (warden BLOCKER,
+// hydra-hq#278 review; pinned by the pathological-input test).
+const PATH_SRC = String.raw`(?:~|\/home\/[A-Za-z0-9_][A-Za-z0-9_.-]*)(?:\/[^\s\/<>|'"\`)\]},;]+)+\/?`;
 const PATH_FULL_RE = new RegExp(`^${PATH_SRC}(?::\\d+(?::\\d+)?)?$`);
 const stripLineRef = (p: string) => p.replace(/:\d+(?::\d+)?$/, '');
 // Exact-match probe for consumers with their own tokenizers (e.g. hq's MarkdownView code spans).

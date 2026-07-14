@@ -76,6 +76,28 @@ describe('path tokens — the click contract', () => {
   });
 });
 
+describe('path tokens — pathological input (the ReDoS class)', () => {
+  // Warden BLOCKER (hydra-hq#278 review): with `/` admitted into the segment class the path
+  // regex was an ambiguous (a+)+ — exponential backtracking on anchored .test(); ~30 backticked
+  // segments + one excluded trailing char froze the console for seconds. Each case below is the
+  // measured blow-up shape at a size (5000 segs) that only a linear regex survives; the 250 ms
+  // budget is ~3 orders of magnitude above the fixed cost (≤1 ms) and ~4 below the broken one.
+  it('anchored probe (isPathToken) stays linear on a near-miss', async () => {
+    const { isPathToken } = await import('./RichMarkdown');
+    const evil = '~' + '/a'.repeat(5000) + '<';
+    const t0 = Date.now();
+    expect(isPathToken(evil)).toBe(false);
+    expect(Date.now() - t0).toBeLessThan(250);
+  });
+
+  it('tokenizer sweep stays linear on a near-miss inside backticks', () => {
+    const evil = '`' + '/home/user' + '/a'.repeat(5000) + '<' + '`';
+    const t0 = Date.now();
+    md(`crash at ${evil} now`);
+    expect(Date.now() - t0).toBeLessThan(250);
+  });
+});
+
 describe('InlineText — plain-text surfaces (user bubbles)', () => {
   it('linkifies URLs and paths but never restyles markdown', () => {
     const html = plain('check https://example.com/pr and ~/notes/x.md in my_var_name *soon*');
