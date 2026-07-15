@@ -183,7 +183,10 @@ function inline(text: string, key: string, onPreview?: (url: string) => void, on
       if (PATH_FULL_RE.test(body)) out.push(<PathToken key={`${key}-c${i}`} path={body} mono onOpenPath={onOpenPath} />);
       else out.push(<code key={`${key}-c${i}`} style={{ fontFamily: C.mono, fontSize: 12, background: 'rgba(34,255,106,.1)', padding: '1px 5px', borderRadius: C.radius, color: C.green }}>{body}</code>);
     } else if (tok.startsWith('**')) {
-      out.push(<strong key={`${key}-b${i}`} style={{ color: C.green, fontWeight: 700 }}>{tok.slice(2, -2)}</strong>);
+      // Recurse into the bold body: a `[link](url)`, `code`, URL, or path inside **…** must stay
+      // live (the "same link: [Merritt 2.0](…)" class — a bold-wrapped link rendered as dead text,
+      // 2026-07-14). Terminates: the body can't contain `*` (regex), so no bold re-match inside.
+      out.push(<strong key={`${key}-b${i}`} style={{ color: C.green, fontWeight: 700 }}>{inline(tok.slice(2, -2), `${key}-b${i}`, onPreview, onOpenPath)}</strong>);
     } else if (tok.startsWith('http')) {
       const [url, trail] = splitTrailingPunct(tok);
       const href = safeUrl(url);
@@ -206,7 +209,8 @@ function inline(text: string, key: string, onPreview?: (url: string) => void, on
       out.push(<PathToken key={`${key}-p${i}`} path={path} onOpenPath={onOpenPath} />);
       if (trail) out.push(<Fragment key={`${key}-pT${i}`}>{trail}</Fragment>);
     } else {
-      out.push(<em key={`${key}-i${i}`}>{tok.slice(1, -1)}</em>);
+      // Same recursion for *em* / _em_ bodies (no `*`/`_` inside per the regex → terminates).
+      out.push(<em key={`${key}-i${i}`}>{inline(tok.slice(1, -1), `${key}-i${i}`, onPreview, onOpenPath)}</em>);
     }
     last = m.index + tok.length; i += 1;
   }
