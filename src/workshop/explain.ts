@@ -61,16 +61,16 @@ export const blockTurnAdapter: ExplainAdapter<BlockTurn> = {
   text: (t) =>
     t.blocks
       .filter((b) => b.kind === 'text')
-      .map((b) => (b as { text: string }).text)
+      .map((b) => (b as unknown as { text: string }).text)
       .join('\n')
       .trim(),
   context: (t) => {
     const parts = t.blocks
       .map((b) => {
         switch (b.kind) {
-          case 'text': return String((b as { text: string }).text).trim();
+          case 'text': return String((b as unknown as { text: string }).text).trim();
           case 'thinking': return '[thinking]';
-          case 'tool_use': return `[tool: ${(b as { name: string }).name}]`;
+          case 'tool_use': return `[tool: ${(b as unknown as { name: string }).name}]`;
           case 'diff': return `[edited ${(b as { file?: string }).file ?? 'a file'}]`;
           case 'tool_result': return (b as { is_error?: boolean }).is_error ? '[tool error]' : '[tool result]';
           case 'ask': return '[asked a question]';
@@ -131,7 +131,13 @@ type NodeLike = {
   getAttribute?: (name: string) => string | null;
   parentNode?: NodeLike | null;
 };
-type RootLike = { contains: (node: unknown) => boolean } | null;
+// `contains` is the one DOM-boundary duck: a real Element passes its `(other: Node | null) => boolean`
+// method here, while internal callers hand it a structural NodeLike and tests hand it a plain fake.
+// The param is `any` on purpose — `unknown` rejects a real Element (its Node-typed param is narrower,
+// contravariance), and `Node | null` rejects the NodeLike we pass internally. `any` accepts all three
+// without coupling the kit to the DOM lib. (Was `unknown`; a strict-TS consumer — hq — couldn't assign
+// an HTMLElement root. v0.10.2.)
+type RootLike = { contains: (node: any) => boolean } | null;   // eslint-disable-line @typescript-eslint/no-explicit-any
 type SelectionLike = {
   isCollapsed: boolean;
   anchorNode: NodeLike | null;
