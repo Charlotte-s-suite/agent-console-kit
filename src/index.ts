@@ -14,3 +14,17 @@ export { safeUrl } from './render/sanitizeUrl';
 export { C } from './render/tokens';
 export { visiblePoll } from './usePoll';
 export { useMediaQuery, useIsMobile, MOBILE_QUERY } from './useMediaQuery';
+
+// ❓ explain / ✍️ sharpen — the Sonnet sidecar (v0.10.0). Transport-agnostic: the consumer supplies
+// a `postWorkshop(payload)` callback and its turn `adapter`; the kit owns the state machine + UI.
+// Pure logic (ported from hydra-hq's explain.ts) + two hooks + five drop-in components.
+export {
+  EXPLAIN_CONTEXT_TURNS, explainRequest, followupThread, priorContext,
+  turnIndexOfNode, resolveSelection, flatTurnAdapter, blockTurnAdapter,
+  type ExplainAdapter, type ExplainPair, type ExplainRequest, type FlatTurn, type BlockTurn,
+} from './workshop/explain';
+export {
+  useExplain, useSharpen,
+  TurnExplainButton, SelectionExplainChip, ExplainCard, SharpenButton, OpenQuestionsStrip,
+  type WorkshopPost, type ExplainCardState, type SelChip,
+} from './workshop/WorkshopSidecar';
