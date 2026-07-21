@@ -54,6 +54,13 @@ export function useExplain<T>({
   turnsRef.current = turns;
   const explainRef = useRef<ExplainCardState | null>(explain);
   explainRef.current = explain;
+  // Monotonic per-request nonce (internal — no consumer API surface). Each explain/follow-up
+  // dispatch claims the next value; a response is applied only while it is still the latest.
+  // The card's `index` check alone can't catch a same-turn-index collision — e.g. excerpt-explain
+  // turn 3 → close → whole-turn ❓ on turn 3: the in-flight excerpt-scoped answer shares the index
+  // and would clobber the fresh card. The nonce drops any response a newer dispatch has superseded.
+  // A ref (never state): it must not trigger a render and must read latest inside async callbacks.
+  const reqNonce = useRef(0);
 
   // one explain post → the explanation string (or a mapped error). The relay stays stateless; a
   // follow-up rides as the trailing empty-answer pair in prior_qa (explain.ts::followupThread).
@@ -72,8 +79,10 @@ export function useExplain<T>({
   // ❓ start an explanation of turn `index` (whole turn, or the highlighted `excerpt`). Opens the
   // card busy, fires the ephemeral call, lands the explanation as the thread's first entry.
   const startExplain = (index: number, excerpt?: string) => {
+    const nonce = ++reqNonce.current;
     setExplain({ index, excerpt, qa: [], busy: true, error: null });
     void runExplain(explainRequest(turnsRef.current, index, adapter, excerpt)).then((res) => {
+      if (reqNonce.current !== nonce) return;   // a newer dispatch superseded this — drop the result
       setExplain((cur) => {
         if (!cur || cur.index !== index) return cur;   // card closed / superseded — drop the result
         return res.ok
@@ -90,12 +99,14 @@ export function useExplain<T>({
     if (!card) return;
     const q = question.trim();
     if (!q || card.busy) return;
+    const nonce = ++reqNonce.current;
     setExplain({ ...card, busy: true, error: null });
     const body: ExplainRequest = {
       ...explainRequest(turnsRef.current, card.index, adapter, card.excerpt),
       prior_qa: followupThread(card.qa, q),
     };
     void runExplain(body).then((res) => {
+      if (reqNonce.current !== nonce) return;   // a newer dispatch superseded this — drop the result
       setExplain((cur) => {
         if (!cur || cur.index !== card.index) return cur;
         return res.ok
@@ -107,8 +118,9 @@ export function useExplain<T>({
 
   const closeExplain = () => setExplain(null);
 
-  // a head switch invalidates any open card / selection chip (they anchor to THIS head's indices)
-  useEffect(() => { setExplain(null); setSelChip(null); }, [resetKey]);
+  // a head switch invalidates any open card / selection chip (they anchor to THIS head's indices) —
+  // bump the nonce too so an in-flight response from the previous head can't land on the new one.
+  useEffect(() => { setExplain(null); setSelChip(null); reqNonce.current++; }, [resetKey]);
 
   // float the ❓ chip near a text selection that lives INSIDE the chat pane. selectionchange only
   // fires on document, so we scope by containment against the scroll root and tear down on unmount.
@@ -138,6 +150,11 @@ export function useExplain<T>({
 // the precise directive draft (or null on failure/empty) — the CALLER lands it as editable draft
 // text; the result is NEVER auto-sent (the operator's send stays the accountable act). Ambiguities
 // the workshop refuses to decide come back as `questions`.
+// (No request nonce here, deliberately: unlike useExplain, sharpen keys nothing by turn index, and
+// the `!text || busy` guard serializes dispatch — a second sharpen can't start until the first
+// resolves and clears busy — so there is no same-index collision for a stale response to win. The
+// draft it returns lands via the caller's own await; there is no shared card for a stale answer to
+// clobber. The nonce is scoped to the explain card, which is the race the kit-owner review flagged.)
 export function useSharpen({ postWorkshop }: { postWorkshop: WorkshopPost }) {
   const [busy, setBusy] = useState(false);
   const [questions, setQuestions] = useState<string[] | null>(null);
