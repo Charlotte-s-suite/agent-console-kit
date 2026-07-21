@@ -12,7 +12,7 @@ frontend).
 
 **Consume it (in hydra-hq or merritt `package.json`):**
 ```json
-"dependencies": { "@charlotte/agent-console-kit": "github:Charlotte-s-suite/agent-console-kit#v0.2.0" }
+"dependencies": { "@charlotte/agent-console-kit": "github:Charlotte-s-suite/agent-console-kit#v0.10.0" }
 ```
 Upgrade both apps with a version bump + `npm update`. (Or a git submodule if you prefer vendoring.)
 
@@ -28,6 +28,31 @@ Upgrade both apps with a version bump + `npm update`. (Or a git submodule if you
 
 All verbatim from HQ, dependency-free beyond React. `sanitizeUrl.test.ts` ships too — the one piece of
 the console with real test coverage; keep it green.
+
+## v0.10.0 — ❓ explain + ✍️ sharpen (the Sonnet sidecar)
+
+The two ephemeral-Sonnet console features, extracted from hydra-hq's `HeadConsole` (hq PR #349) as
+**transport-agnostic** components so hq and merritt share one source of truth. Both are
+**operator-side sidecars** — they NEVER touch the agent's session or transcript. The consumer owns
+transport: it supplies a single `postWorkshop(payload) => Promise<result>` callback (which does the
+fetch/poll or inline call) and a turn `adapter`; the kit owns the state machine + UI.
+
+| Export | What it is | Coupling |
+|---|---|---|
+| `useExplain` | the ❓ controller — owns the explain card + selection chip; `startExplain` / `askFollowup` / `closeExplain` | none — calls `postWorkshop` |
+| `useSharpen` | the ✍️ controller — `sharpen(idea)` resolves the precise draft (never auto-sent) + surfaced open questions | none — calls `postWorkshop` |
+| `TurnExplainButton` | the per-turn ❓ affordance — a naked glyph (mobile-primary path) | none |
+| `SelectionExplainChip` | the floating ❓ chip for a live text selection (desktop precision path) | none |
+| `ExplainCard` | inline dismissible card — running Q&A thread (markdown) + "ask more" input | none |
+| `SharpenButton` | the ✍️ workshop button (disabled until there's a draft) | none |
+| `OpenQuestionsStrip` | ambiguities the workshop refused to decide, beside the composer | none |
+| `explainRequest` / `followupThread` / `priorContext` / `resolveSelection` / `turnIndexOfNode` | the pure logic (ported from hq's `explain.ts`, 22 tests) — context assembly, selection→turn resolution, the trailing-`{q,a:""}` follow-up convention | none |
+| `flatTurnAdapter` / `blockTurnAdapter` | ready adapters for merritt's flat `{role,text}` transcript and hq's `{type,blocks}` shape | none |
+
+Turn-shape independence is via `ExplainAdapter<T>` (a turn → its explainable `text` + role-tagged
+`context`), so the same logic serves hq's Claude-Code block union and merritt's flat transcript. The
+selection resolvers are duck-typed (not `instanceof Element`) so they run in the browser AND unit-test
+without a DOM dev-dependency. Register: naked glyphs, minimal chrome (Schyler's ratified density floor).
 
 ## v0.4 — comprehensive accessory bar + sticky modifiers + tmux chords
 
