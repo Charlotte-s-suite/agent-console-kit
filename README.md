@@ -54,6 +54,36 @@ Turn-shape independence is via `ExplainAdapter<T>` (a turn → its explainable `
 selection resolvers are duck-typed (not `instanceof Element`) so they run in the browser AND unit-test
 without a DOM dev-dependency. Register: naked glyphs, minimal chrome (Schyler's ratified density floor).
 
+## v0.11.0 — StatusLine (the console's bottom data-line)
+
+The console's bottom status bar, extracted from hydra-hq as a **transport-agnostic** component so hq
+and merritt share one line. It renders: an animated busy/idle indicator (the "green light" — spinner
+while working, amber blink while waiting, faint dot idle/offline), the agent name + running model, the
+session's live **context · output tokens**, the **⊟ compact** and **♻️ consolidate+refresh** controls
+(hold-to-confirm, idle-only, the ⊟ doubling as a context-pressure gauge: amber ≥200k / red ≥400k /
+blink ≥600k), and the account's Claude-plan **limit bars** (daily 5h + weekly 7d + model-scoped caps).
+**Responsive shedding is preserved** — on a narrow container it DROPS the least-important items
+(≈$/wk, then the model chip) instead of clipping the binding limit (phone-first).
+
+Unlike hq's original, the kit component does **no fetching**: the consumer polls the data and passes
+it as props (`status`, `name`, `model`, `usage`, `limits`, `weeklyUsd`) and supplies the action
+callbacks (`onCompact` / `onRefresh` → `Promise<boolean>`; `onInterrupt`). The 🧠 context-anatomy
+drawer is deep-hq, so the context counter's tap is an **optional `onContextClick`** — omit it and the
+counter renders as plain text (no drawer). Controls render only when their callback is wired.
+
+| Export | What it is | Coupling |
+|---|---|---|
+| `StatusLine` | the whole data-line (busy indicator + name/model + context/tokens + ⊟/♻️ + limit bars + shedding) | none — data props + action callbacks |
+| `CompactButton` | ⊟ hold-to-confirm /compact + the context-pressure gauge | none — calls `onCompact` |
+| `ConsolidateRefreshButton` | ♻️ hold-to-confirm consolidate + deferred /clear | none — calls `onRefresh` |
+| `InterruptButton` | ■ phone-first STOP (header + inline variants) | none — calls `onInterrupt` |
+| `fmtTok` / `fmtUsd` / `urgency` | the token/USD formatters + the gauge-tier helper | none |
+| `HeadStatus` / `SessionUsage` / `Limits` / `ModelLimit` + the action types | the data + callback contracts | none |
+
+**Strict-typecheck gate (task 89ee0f):** this release adds `tsc --noEmit` (a `tsconfig.json` + a
+`typecheck` script) and runs it FIRST in `npm test`, so an untyped-check regression can't slip in
+again — hq consumes this kit under strict tsc, and the gate now proves the whole `src/` tree clean.
+
 ## v0.4 — comprehensive accessory bar + sticky modifiers + tmux chords
 
 The TUI accessory bar is now full raw-terminal grade (for HQ's WSL/tmux panes):

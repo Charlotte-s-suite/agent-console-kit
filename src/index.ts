@@ -28,3 +28,16 @@ export {
   TurnExplainButton, SelectionExplainChip, ExplainCard, SharpenButton, OpenQuestionsStrip,
   type WorkshopPost, type ExplainCardState, type SelChip,
 } from './workshop/WorkshopSidecar';
+
+// StatusLine — the console's bottom data-line (busy/idle indicator, name + model, live context/output
+// tokens, ⊟ compact + ♻️ refresh controls, account Claude-limit bars, responsive shedding). v0.11.0:
+// TRANSPORT-AGNOSTIC — the consumer polls the data + supplies the action callbacks; the kit owns the
+// rendering + the small controls' state machines. Ported from hydra-hq. See src/status/.
+export { default as StatusLine, fmtTok, fmtUsd, type StatusLineProps } from './status/StatusLine';
+export { default as CompactButton, urgency, AMBER_AT, RED_AT, BLINK_AT, type CompactButtonProps } from './status/CompactButton';
+export { default as ConsolidateRefreshButton, type ConsolidateRefreshButtonProps } from './status/ConsolidateRefreshButton';
+export { default as InterruptButton, type InterruptButtonProps } from './status/InterruptButton';
+export {
+  type HeadStatus, type SessionUsage, type Limits, type ModelLimit,
+  type CompactAction, type RefreshAction, type InterruptAction,
+} from './status/types';
