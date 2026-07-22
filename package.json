@@ -1,11 +1,12 @@
 {
   "name": "@charlotte/agent-console-kit",
-  "version": "0.10.2",
+  "version": "0.11.0",
   "description": "Shared agent-console UI primitives — the reusable core of the Hydra HQ console, consumed by hydra-hq and merritt as a single source of truth.",
   "type": "module",
   "main": "src/index.ts",
   "scripts": {
-    "test": "vitest run"
+    "typecheck": "tsc --noEmit",
+    "test": "tsc --noEmit && vitest run"
   },
   "peerDependencies": {
     "react": ">=18",
@@ -13,6 +14,7 @@
   },
   "devDependencies": {
     "@testing-library/react": "^16.3.2",
+    "@types/node": "^24.0.0",
     "@types/react": "^18.2.43",
     "@types/react-dom": "^18.2.17",
     "happy-dom": "^20.10.6",
